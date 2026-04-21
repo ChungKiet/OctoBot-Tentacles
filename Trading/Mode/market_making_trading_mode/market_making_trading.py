@@ -661,7 +661,7 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
                 f" {self.exchange_manager.exchange_name}: {reference_price=}"
             )
             return False
-        daily_base_volume, daily_quote_volume = self._get_daily_volume(reference_price)
+        daily_base_volume, daily_quote_volume = await self._get_daily_volume(reference_price)
         if not all(v and not v.is_nan() for v in (daily_base_volume, daily_quote_volume)):
             method = self.logger.info if self.is_first_execution else self.logger.error
             method(
@@ -1177,17 +1177,29 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
             orders += list(bids)
         return orders
 
-    def _get_daily_volume(self, reference_price: decimal.Decimal) -> (decimal.Decimal, decimal.Decimal):
+    async def _get_daily_volume(self, reference_price: decimal.Decimal) -> (decimal.Decimal, decimal.Decimal):
         symbol_data = self.exchange_manager.exchange_symbols_data.get_exchange_symbol_data(
             self.symbol, allow_creation=False
         )
         try:
-            return trading_api.get_daily_base_and_quote_volume(symbol_data, reference_price)
-        except ValueError as err:
-            raise ValueError(
-                f"Missing volume for {self.symbol} on {self.exchange_manager.exchange_name}: "
-                f"{err}. {reference_price=}"
-            ) from err
+            base_vol, quote_vol = trading_api.get_daily_base_and_quote_volume(symbol_data, reference_price)
+            if base_vol and not base_vol.is_nan() and quote_vol and not quote_vol.is_nan():
+                return base_vol, quote_vol
+        except (ValueError, Exception):
+            pass
+        try:
+            client = self.exchange_manager.exchange.connector.client
+            ticker = await client.fetch_ticker(self.symbol)
+            base_vol = decimal.Decimal(str(ticker.get("baseVolume") or 0))
+            quote_vol = decimal.Decimal(str(ticker.get("quoteVolume") or 0))
+            if base_vol and not base_vol.is_nan() and base_vol > 0:
+                return base_vol, quote_vol
+        except Exception:
+            pass
+        raise ValueError(
+            f"Missing volume for {self.symbol} on {self.exchange_manager.exchange_name}. "
+            f"{reference_price=}"
+        )
 
     def _get_available_funds(self) -> (decimal.Decimal, decimal.Decimal):
         base, quote = symbol_util.parse_symbol(self.symbol).base_and_quote()
