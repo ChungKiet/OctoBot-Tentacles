@@ -17,6 +17,7 @@ import copy
 import dataclasses
 import decimal
 import typing
+import random
 
 import octobot_commons.logging as commons_logging
 import octobot_trading.constants as trading_constants
@@ -35,6 +36,7 @@ MAX_HANDLED_ASKS_ORDERS = 5
 
 INCREASING = "increasing_towards_current_price"
 DECREASING = "decreasing_towards_current_price"
+RANDOM = "random"
 
 # allow up to 10 decimals to avoid floating point precision issues due to percent ratios
 _MAX_PRECISION = decimal.Decimal("1.0000000000")
@@ -57,6 +59,9 @@ class BookOrderData:
 
     def get_base_amount(self) -> decimal.Decimal:
         return self.amount * self.price if self.side == trading_enums.TradeOrderSide.BUY else self.amount
+    
+    def __repr__(self) -> str:
+        return f"BookOrderData(price={self.price}, amount={self.amount}, side={self.side} (cost={self.price * self.amount}))"
 
 
 class FullBookRebalanceRequired(Exception):
@@ -304,7 +309,7 @@ class OrderBookDistribution:
         self, ideal_total_volume: decimal.Decimal, total_volume: decimal.Decimal,
         side: trading_enums.TradeOrderSide, tolerated_bellow_depth_ratio=DEFAULT_TOLERATED_BELLOW_DEPTH_RATIO
     ) -> bool:
-        return ideal_total_volume * tolerated_bellow_depth_ratio > total_volume
+        return ideal_total_volume * tolerated_bellow_depth_ratio >= total_volume
 
     def _are_total_order_volumes_compatible_with_config(
         self,
@@ -667,7 +672,7 @@ class OrderBookDistribution:
 
     def _get_order_volumes(
         self, side: trading_enums.TradeOrderSide, total_volume: decimal.Decimal, order_prices: list[decimal.Decimal],
-        multiplier=decimal.Decimal(1), direction=DECREASING
+        multiplier=decimal.Decimal(1), direction: typing.Union[DECREASING, INCREASING, RANDOM] = DECREASING
     ) -> list[decimal.Decimal]:
         orders_count = len(order_prices)
         if orders_count < 2:
@@ -677,7 +682,6 @@ class OrderBookDistribution:
             average_order_size = total_volume / decimal_orders_count
             max_size_delta = average_order_size * (multiplier - 1)
             increment = max_size_delta / decimal_orders_count
-
             # base_vol + base_vol + increment + base_vol + 2 x increment + .... = total_volume
             # order_count: 1 => 0 = 0 increment
             # order_count: 2 => 0 + 1 = 1 increments
@@ -693,6 +697,15 @@ class OrderBookDistribution:
             order_volumes = [
                 base_vol + (increment * decimal.Decimal(str(i)))
                 for i in iterator
+            ]
+        elif direction == RANDOM:
+            min_multiplier = float(trading_constants.ONE - (multiplier))
+            max_multiplier = float(trading_constants.ONE + (multiplier))
+            multipliers = [random.uniform(min_multiplier, max_multiplier) for _ in range(orders_count)]
+            total_multiplier = sum(multipliers)
+            order_volumes = [
+                total_volume * decimal.Decimal(str(multiplier / total_multiplier))
+                for multiplier in multipliers
             ]
         else:
             raise NotImplementedError(f"{direction} not implemented")

@@ -21,6 +21,7 @@ import decimal
 import typing
 
 import octobot_commons.enums as commons_enums
+import octobot_commons.constants as common_constants
 import octobot_commons.symbols.symbol_util as symbol_util
 import octobot_commons.pretty_printer
 import octobot_tentacles_manager.api
@@ -32,7 +33,6 @@ import octobot_trading.errors as trading_errors
 import octobot_trading.modes as trading_modes
 import octobot_trading.personal_data as trading_personal_data
 import octobot_trading.exchanges as trading_exchanges
-import octobot_tentacles_manager.configuration as tm_configuration
 import tentacles.Trading.Mode.market_making_trading_mode.order_book_distribution as order_book_distribution
 import tentacles.Trading.Mode.market_making_trading_mode.reference_price as reference_price_import
 
@@ -173,22 +173,6 @@ class MarketMakingTradingMode(trading_modes.AbstractTradingMode):
         return [MarketMakingTradingModeConsumer]
 
     @classmethod
-    async def get_forced_updater_channels(
-        cls, 
-        exchange_manager: trading_exchanges.ExchangeManager,
-        tentacles_setup_config: tm_configuration.TentaclesSetupConfiguration, 
-        trading_config: typing.Optional[dict]
-    ) -> set[trading_exchanges.ChannelSpecs]:
-        return set([
-            trading_exchanges.ChannelSpecs(
-                channel=trading_constants.TICKER_CHANNEL,
-            ),
-            trading_exchanges.ChannelSpecs(
-                channel=trading_constants.TRADES_CHANNEL,
-            )
-        ])
-
-    @classmethod
     def get_is_trading_on_exchange(cls, exchange_name, tentacles_setup_config) -> bool:
         """
         returns True if exchange_name is trading exchange or the hedging exchange
@@ -300,6 +284,12 @@ class MarketMakingTradingModeConsumer(trading_modes.AbstractTradingModeConsumer)
         current_price = data[self.CURRENT_PRICE_KEY]
         symbol_market = data[self.SYMBOL_MARKET_KEY]
         try:
+            if self.trading_mode.producers[0].should_stop:
+                self.logger.info(
+                    f"Skipping creating new orders for {symbol} {self.exchange_manager.exchange_name}: "
+                    f"bot should stop"
+                )
+                return []
             if order_actions_plan.cancelled:
                 # any plan can be cancelled if it did not start processing
                 self.logger.info(f"Cancelling {str(order_actions_plan)} action plan processing: plan did not start")
@@ -310,7 +300,12 @@ class MarketMakingTradingModeConsumer(trading_modes.AbstractTradingModeConsumer)
         finally:
             order_actions_plan.processed.set()
 
-    async def _process_plan(self, order_actions_plan: OrdersUpdatePlan, current_price, symbol_market):
+    async def _process_plan(
+        self,
+        order_actions_plan: OrdersUpdatePlan,
+        current_price: decimal.Decimal,
+        symbol_market: dict
+    ):
         created_orders = []
         cancelled_orders = []
         processed_actions = {}
@@ -451,8 +446,8 @@ class MarketMakingTradingModeConsumer(trading_modes.AbstractTradingModeConsumer)
                 )
         except (SkippedAction, trading_errors.MissingFunds):
             raise
-        except Exception as e:
-            self.logger.error(f"Failed to create order : {e}. Order: {order_data}")
+        except Exception as err:
+            self.logger.error(f"Failed to create order : {err}. Order: {order_data}")
             return []
         return [] if created_order is None else [created_order]
 
@@ -496,13 +491,13 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
 
         self.symbol_trading_config: dict = None
         self.healthy = False
-        self.subscribed_channel_specs_by_exchange_id: dict[str, set[trading_exchanges.ChannelSpecs]] = {}
         self.is_first_execution: bool = True
         self._started_at: float = 0
         self._last_error_at: float = 0
         self.latest_actions_plan: OrdersUpdatePlan = None
         self.last_target_buy_orders_count: int = 0
         self.last_target_sell_orders_count: int = 0
+        self.subscribed_requirements_exchange_ids: set[str] = set()
 
         try:
             self._load_symbol_trading_config()
@@ -516,7 +511,8 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
         self.read_config()
 
         self.logger.debug(f"Loaded healthy config for {self.symbol}")
-        self.healthy = True
+        self.healthy: bool = True
+        self._last_disabled_trader_log_at: float = 0
 
     def _load_symbol_trading_config(self) -> bool:
         self.symbol_trading_config = self.trading_mode.get_pair_settings()[0]
@@ -560,12 +556,23 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
     async def start(self) -> None:
         await super().start()
         if self.healthy:
+            await self._register_pair_requirement_on_reference_exchange()
             self.logger.debug(f"Initializing orders creation")
             await self._ensure_market_making_orders_and_reschedule()
 
     async def set_final_eval(self, matrix_id: str, cryptocurrency: str, symbol: str, time_frame, trigger_source: str):
         # nothing to do: this is not a strategy related trading mode
         pass
+
+    async def _register_pair_requirement_on_reference_exchange(self):
+        await trading_api.register_new_pairs_on_exchange(
+            self.exchange_manager.exchange_name,
+            trading_api.get_matrix_id_from_exchange_id(
+                self.exchange_manager.exchange_name, self.exchange_manager.id
+            ),
+            [self.symbol],
+            watch_only=True
+        )
 
     def _schedule_order_refresh(self):
         # schedule order creation / health check
@@ -603,7 +610,7 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
                 self._schedule_order_refresh
             )
 
-    async def _ensure_market_making_orders(self, trigger_source: str):
+    async def _ensure_market_making_orders(self, trigger_source: str) -> bool:
         # can be called:
         #   - on initialization
         #   - when price moves beyond spread
@@ -615,40 +622,50 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
         )
         return await self.create_state(current_price, symbol_market, trigger_source, False)
 
-    async def create_state(self, current_price, symbol_market, trigger_source: str, force_full_refresh: bool):
+    async def create_state(
+        self, current_price, symbol_market, trigger_source: str, force_full_refresh: bool
+    ) -> bool:
         if current_price is not None:
             async with self.trading_mode_trigger(skip_health_check=True):
-                if self.exchange_manager.trader.is_enabled:
-                    try:
-                        if await self._handle_market_making_orders(
-                            current_price, symbol_market, trigger_source, force_full_refresh
-                        ):
-                            self.is_first_execution = False
-                            self._started_at = self.exchange_manager.exchange.get_exchange_current_time()
-                            return True
-                    except ValueError as err:
-                        if self._last_error_at <= self._started_at:
-                            # only log full exception every 1st time it occurs then use warnings to avoid flooding
-                            # when on websockets
-                            self.logger.exception(
-                                err, True, f"Unexpected error when starting {self.symbol} trading mode: {err}"
-                            )
-                        else:
-                            self.logger.warning(f"Skipped {self.symbol} orders update: {err}")
-                        self._last_error_at = self.exchange_manager.exchange.get_exchange_current_time()
-                        if "Missing volume" not in str(err):
-                            # config error: should not happen, in this case, return true to skip auto reschedule
-                            await self.sent_once_critical_notification(
-                                "Configuration issue",
-                                f"Impossible to start {self.symbol} market making "
-                                f"on {self.exchange_manager.exchange_name}: {err}"
-                            )
+                try:
+                    if await self._handle_market_making_orders(
+                        current_price, symbol_market, trigger_source, force_full_refresh
+                    ):
+                        self.is_first_execution = False
+                        self._started_at = self.exchange_manager.exchange.get_exchange_current_time()
                         return True
+                except trading_errors.TraderDisabledError as err:
+                    current_time = self.exchange_manager.exchange.get_exchange_current_time()
+                    current_minute_ts = current_time - current_time % (5 * common_constants.MINUTE_TO_SECONDS)
+                    if self._last_disabled_trader_log_at < current_minute_ts:
+                        # log warning at most once per 5 minutes to avoid spamming at each new price
+                        self.logger.warning(str(err))
+                        self._last_disabled_trader_log_at = current_minute_ts
+                    return False
+                except ValueError as err:
+                    if self._last_error_at <= self._started_at:
+                        # only log full exception every 1st time it occurs then use warnings to avoid flooding
+                        # when on websockets
+                        self.logger.exception(
+                            err, True, f"Unexpected error when starting {self.symbol} trading mode: {err}"
+                        )
+                    else:
+                        self.logger.warning(f"Skipped {self.symbol} orders update: {err}")
+                    self._last_error_at = self.exchange_manager.exchange.get_exchange_current_time()
+                    if "Missing volume" not in str(err):
+                        # config error: should not happen, in this case, return true to skip auto reschedule
+                        await self.sent_once_critical_notification(
+                            "Configuration issue",
+                            f"Impossible to start {self.symbol} market making "
+                            f"on {self.exchange_manager.exchange_name}: {err}"
+                        )
+                    return True
         return False
 
     def _is_previous_plan_still_processing(self) -> bool:
         return self.latest_actions_plan is not None and not self.latest_actions_plan.processed.is_set()
 
+    @trading_modes.enabled_trader_only(raise_when_disabled=True)
     async def _handle_market_making_orders(
         self, current_price, symbol_market, trigger_source: str, force_full_refresh: bool
     ):
@@ -1110,6 +1127,12 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
         return False
 
     async def _schedule_order_actions(self, order_actions_plan: OrdersUpdatePlan, current_price, symbol_market):
+        if self.should_stop:
+            self.logger.info(
+                f"Skipping scheduling order actions for {self.symbol} {self.exchange_manager.exchange_name}: "
+                f"bot should stop"
+            )
+            return
         self.logger.info(
             f"Scheduling {self.symbol} {self.exchange_manager.exchange_name} {str(order_actions_plan)} using "
             f"current price: {current_price}"
@@ -1187,6 +1210,7 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
                 return base_vol, quote_vol
         except (ValueError, Exception):
             pass
+        # Fallback: fetch 24h ticker directly from CCXT
         try:
             client = self.exchange_manager.exchange.connector.client
             ticker = await client.fetch_ticker(self.symbol)
@@ -1307,34 +1331,8 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
         """
         await self._on_reference_price_update()
 
-    async def _subscribe_to_exchange_mark_price(self, exchange_id: str, exchange_manager):
-        specs = trading_exchanges.ChannelSpecs(
-            trading_constants.MARK_PRICE_CHANNEL,
-            self.trading_mode.symbol,
-            None
-        )
-        if not self.already_subscribed_to_channel(exchange_id, specs):
-            await exchanges_channel.get_chan(trading_constants.MARK_PRICE_CHANNEL, exchange_id).new_consumer(
-                callback=self._mark_price_callback,
-                symbol=self.trading_mode.symbol
-            )
-            if exchange_id not in self.subscribed_channel_specs_by_exchange_id:
-                self.subscribed_channel_specs_by_exchange_id[exchange_id] = set()
-            self.subscribed_channel_specs_by_exchange_id[exchange_id].add(specs)
-            self.logger.info(
-                f"{self.trading_mode.get_name()} for {self.trading_mode.symbol} on {self.exchange_name}:  "
-                f"{exchange_manager.exchange_name} price data feed."
-            )
-
-    def already_subscribed_to_channel(self, exchange_id: str, specs: trading_exchanges.ChannelSpecs) -> bool:
-        return (
-            exchange_id in self.subscribed_channel_specs_by_exchange_id
-            and specs in self.subscribed_channel_specs_by_exchange_id[exchange_id]
-        )
-
-    async def _get_reference_price(self) -> decimal.Decimal:
+    async def _register_pair_requirement_on_reference_exchanges(self):
         local_exchange_name = self.exchange_manager.exchange_name
-        price = trading_constants.ZERO
         for exchange_id in trading_api.get_all_exchange_ids_with_same_matrix_id(
             local_exchange_name, self.exchange_manager.id
         ):
@@ -1350,8 +1348,54 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
             ) else exchange_manager.exchange_name
             if other_exchange_key != self.reference_price.exchange:
                 continue
-            if exchange_id not in self.subscribed_exchange_ids:
+            if exchange_id not in self.subscribed_requirements_exchange_ids:
                 await self._subscribe_to_exchange_mark_price(exchange_id, exchange_manager)
+                self.subscribed_requirements_exchange_ids.add(exchange_id)
+    
+    def _is_registered_on_all_reference_exchanges(self) -> bool:
+        return len(self.subscribed_requirements_exchange_ids) == 1
+
+    async def _subscribe_to_exchange_mark_price(self, exchange_id: str, exchange_manager):
+        if not self.already_subscribed_to_channel(
+            exchange_id, trading_constants.MARK_PRICE_CHANNEL, self._mark_price_callback, symbol=self.trading_mode.symbol
+        ):
+            await exchanges_channel.get_chan(trading_constants.MARK_PRICE_CHANNEL, exchange_id).new_consumer(
+                callback=self._mark_price_callback,
+                symbol=self.trading_mode.symbol
+            )
+            self.logger.info(
+                f"{self.trading_mode.get_name()} for {self.trading_mode.symbol} on {self.exchange_name}  "
+                f"subscribed to {exchange_manager.exchange_name} price data feed."
+            )
+
+    def already_subscribed_to_channel(
+        self, exchange_id: str, channel: str, callback: typing.Callable, **filter_kwargs
+    ) -> bool:
+        chan = exchanges_channel.get_chan(channel, exchange_id)
+        consumers = chan.get_consumer_from_filters(filter_kwargs)
+        return any(consumer.callback == callback for consumer in consumers)
+
+    async def _register_on_reference_exchanges_if_required(self) -> bool:
+        """
+        Returns True if all reference exchanges have already been registered
+        """
+        if self._is_registered_on_all_reference_exchanges():
+            return True
+        self.logger.debug(
+            f"Not all reference exchanges are registered for {self.symbol}. Skipping trigger for {self.symbol}"
+        )
+        await self._register_pair_requirement_on_reference_exchanges()
+        return self._is_registered_on_all_reference_exchanges()
+
+    async def _get_reference_price(self) -> decimal.Decimal:
+        if not await self._register_on_reference_exchanges_if_required():
+            return trading_constants.ZERO
+        local_exchange_name = self.exchange_manager.exchange_name
+        price = trading_constants.ZERO
+        for exchange_id in trading_api.get_all_exchange_ids_with_same_matrix_id(
+            local_exchange_name, self.exchange_manager.id
+        ):
+            exchange_manager = trading_api.get_exchange_manager_from_exchange_id(exchange_id)
             try:
                 price, updated = trading_personal_data.get_potentially_outdated_price(
                     exchange_manager, self.reference_price.pair
@@ -1367,7 +1411,7 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
                         self.exchange_manager.exchange.get_exchange_current_time() - self._started_at
                         > self.REFERENCE_PRICE_INIT_DELAY
                     )
-                    else self.logger.warning()
+                    else self.logger.warning
                 )
                 method(
                     f"No {exchange_manager.exchange_name} exchange symbol data for {self.symbol}, "

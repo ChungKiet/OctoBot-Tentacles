@@ -44,16 +44,19 @@ import octobot_commons.logging as bot_logging
 import octobot_commons.enums as commons_enums
 import octobot_commons.databases as commons_databases
 import octobot_commons.configuration as configuration
+import octobot_commons.dict_util as dict_util
 import octobot_commons.tentacles_management as tentacles_management
 import octobot_commons.time_frame_manager as time_frame_manager
 import octobot_commons.authentication as authentication
 import octobot_commons.symbols as commons_symbols
+import octobot_commons.symbols as symbol_utils
 import octobot_commons.display as display
 import octobot_commons.errors as commons_errors
 import octobot_commons.aiohttp_util as aiohttp_util
 import octobot_commons.html_util as html_util
 import octobot_commons
 import octobot_backtesting.api as backtesting_api
+import octobot.errors as errors
 import octobot.community as community
 import octobot.constants as octobot_constants
 import octobot.enums as octobot_enums
@@ -61,6 +64,8 @@ import octobot.configuration_manager as configuration_manager
 import octobot.databases_util as octobot_databases_util
 import tentacles.Services.Interfaces.web_interface.constants as constants
 import tentacles.Services.Interfaces.web_interface.models as models
+import tentacles.Services.Interfaces.web_interface.models.json_schemas as json_schemas
+import tentacles.Services.Interfaces.web_interface.models.trading as models_trading
 import tentacles.Services.Interfaces.web_interface.plugins as web_plugins
 
 NAME_KEY = "name"
@@ -97,7 +102,6 @@ DISPLAYED_ELEMENTS_KEY = "displayed_elements"
 # tentacles from which configuration is not handled in strategies / evaluators configuration and that can be groupped
 GROUPPABLE_NON_TRADING_STRATEGY_RELATED_TENTACLES = [
     tentacles_manager_constants.TENTACLES_BACKTESTING_PATH,
-    tentacles_manager_constants.TENTACLES_SERVICES_PATH,
     tentacles_manager_constants.TENTACLES_TRADING_PATH
 ]
 # tentacles for which configuration can be done in the tentacles tab of profile config
@@ -492,6 +496,8 @@ def update_tentacle_config(tentacle_name, config_update, tentacle_class=None, te
             config_update
         )
         return True, f"{tentacle_name} updated"
+    except errors.InvalidAutomationConfigError:
+        raise # propagate the error to the caller
     except Exception as e:
         _get_logger().exception(e, False)
         return False, f"Error when updating tentacle config: {e}"
@@ -696,7 +702,8 @@ def get_config_activated_evaluators(tentacles_setup_config=None):
 
 def has_futures_exchange():
     for exchange_manager in get_live_trading_enabled_exchange_managers():
-        if trading_api.get_exchange_type(exchange_manager) is trading_enums.ExchangeTypes.FUTURE:
+        exchange_type = trading_api.get_exchange_type(exchange_manager)
+        if exchange_type is trading_enums.ExchangeTypes.FUTURE or exchange_type is trading_enums.ExchangeTypes.OPTION:
             return True
     return False
 
@@ -745,7 +752,7 @@ async def _reset_profile_portfolio_history(current_edited_config):
                         == trading_enums.ExchangeTypes.FUTURE) != is_future):
                 metadb = commons_databases.MetaDatabase(run_dbs_identifier)
                 portfolio_db = metadb.get_historical_portfolio_value_db(
-                    trading_api.get_account_type(is_future, False, False, True), exchange
+                    trading_api.get_account_type(is_future, False, False, False, True), exchange
                 )
                 await trading_api.clear_database_storage_history(
                     trading_storage.PortfolioStorage, portfolio_db, False
@@ -843,7 +850,7 @@ def get_beta_env_enabled_in_config():
 
 def get_services_list():
     services = {}
-    for service in services_api.get_available_services():
+    for service in services_api.get_available_services() + services_api.get_available_ai_services():
         srv = service.instance()
         if srv.get_required_config():
             # do not add services without a config, ex: GoogleService (nothing to show on the web interface)
@@ -1556,3 +1563,147 @@ def get_live_trading_enabled_exchange_managers():
         if not trading_api.get_is_backtesting(exchange_manager)
         and trading_api.is_trader_existing_and_enabled(exchange_manager)
     ]
+
+
+def save_distribution_configuration(
+    trading_mode_name: str,
+    trading_mode_configuration: dict,
+    enabled_exchange: typing.Optional[str],
+    trading_pair: typing.Optional[str],
+    exchange_configurations: list[dict],
+    trading_simulator_configuration: dict,
+    simulated_portfolio_configuration: list[dict],
+    exchanges_to_enable: typing.Optional[list[str]] = None,
+) -> None:
+    _save_distribution_tentacle_config(trading_mode_name, trading_mode_configuration)
+    _save_distribution_user_config(
+        enabled_exchange, trading_pair, exchange_configurations,
+        trading_simulator_configuration, simulated_portfolio_configuration,
+        exchanges_to_enable,
+    )
+
+
+def _save_distribution_user_config(
+    enabled_exchange: typing.Optional[str],
+    trading_pair: typing.Optional[str],
+    exchange_configurations: list[dict],
+    trading_simulator_configuration: dict,
+    simulated_portfolio_configuration: list[dict],
+    exchanges_to_enable: typing.Optional[list[str]] = None,
+) -> None:
+    current_edited_config = interfaces_util.get_edited_config(dict_only=False)
+
+    # exchanges: regenerate the whole configuration
+    exchange_config_update = json_schemas.json_exchange_config_to_config(
+        exchange_configurations, False
+    )
+    if exchange_config_update and enabled_exchange not in exchange_config_update:
+        # removed enabled exchange from exchange configs: use 1st exchange instead
+        enabled_exchange = next(iter(exchange_config_update))
+
+    # Determine which exchanges to enable
+    if exchanges_to_enable is None:
+        exchanges_to_enable = [enabled_exchange] if enabled_exchange else []
+    
+    for exchange in exchanges_to_enable:
+        if exchange and exchange in exchange_config_update:
+            # only enable selected exchanges, force spot trading
+            exchange_config_update[exchange].update({
+                commons_constants.CONFIG_ENABLED_OPTION: True,
+                commons_constants.CONFIG_EXCHANGE_TYPE: commons_constants.CONFIG_EXCHANGE_SPOT,
+            })
+    
+    current_exchanges_config = copy.deepcopy(current_edited_config.config[commons_constants.CONFIG_EXCHANGES])
+    # nested_update_dict to keep nested key/val that might have been in previous config but are not in update
+    # don't pass current_exchanges_config directly to really delete exchanges
+    updated_exchange_config = {
+        exchange: exchange_config
+        for exchange, exchange_config in current_exchanges_config.items()
+        if exchange in exchange_config_update
+    }
+    dict_util.nested_update_dict(updated_exchange_config, exchange_config_update)
+
+    # currencies: regenerate the whole configuration
+    updated_currencies_config = {
+        trading_pair: {
+            commons_constants.CONFIG_ENABLED_OPTION: True,
+            commons_constants.CONFIG_CRYPTO_PAIRS: [trading_pair]
+        }
+    } if trading_pair else {}
+
+    # trader simulator
+    simulated_enabled = trading_simulator_configuration[commons_constants.CONFIG_ENABLED_OPTION]
+    updated_simulator_config = copy.deepcopy(current_edited_config.config[commons_constants.CONFIG_SIMULATOR])
+    previous_simulated_portfolio = copy.deepcopy(
+        updated_simulator_config.get(commons_constants.CONFIG_STARTING_PORTFOLIO)
+    )
+    simulator_config_update = {
+        **trading_simulator_configuration, **{
+            commons_constants.CONFIG_STARTING_PORTFOLIO: json_schemas.json_simulated_portfolio_to_config(
+                simulated_portfolio_configuration
+            )
+        }
+    }
+    updated_portfolio = simulator_config_update[commons_constants.CONFIG_STARTING_PORTFOLIO]
+    changed_portfolio = _filter_distribution_0_values(previous_simulated_portfolio) != _filter_distribution_0_values(updated_portfolio)
+    # replace portfolio to allow asset removal (otherwise nested_update_dict will never remove assets)
+    updated_simulator_config[commons_constants.CONFIG_STARTING_PORTFOLIO] = updated_portfolio
+    dict_util.nested_update_dict(updated_simulator_config, simulator_config_update)
+
+    # real trader
+    updated_trader_config = copy.deepcopy(current_edited_config.config[commons_constants.CONFIG_TRADER])
+    # only update the "enabled" state
+    updated_trader_config[commons_constants.CONFIG_ENABLED_OPTION] = not simulated_enabled
+
+    # trading
+    updated_trading_config = copy.deepcopy(current_edited_config.config[commons_constants.CONFIG_TRADING])
+    if trading_pair:
+        # only update the reference market
+        updated_trading_config[commons_constants.CONFIG_TRADER_REFERENCE_MARKET] = (
+            symbol_utils.parse_symbol(trading_pair).quote
+        )
+
+    update = {
+        commons_constants.CONFIG_CRYPTO_CURRENCIES: updated_currencies_config,
+        commons_constants.CONFIG_EXCHANGES: updated_exchange_config,
+        commons_constants.CONFIG_TRADING: updated_trading_config,
+        commons_constants.CONFIG_TRADER: updated_trader_config,
+        commons_constants.CONFIG_SIMULATOR: updated_simulator_config,
+    }
+    # apply & save changes
+    current_edited_config.config.update(update)
+    current_edited_config.save()
+    _get_distribution_logger().info(
+        f"Configuration updated. Current profile: {current_edited_config.profile.name}"
+    )
+    if changed_portfolio:
+        _get_distribution_logger().info("Simulated portfolio changed: resetting simulated portfolio content.")
+        models_trading.clear_exchanges_portfolio_history(simulated_only=True)
+
+
+def _save_distribution_tentacle_config(
+    trading_mode_name: str,
+    trading_mode_configuration: dict,
+) -> None:
+    tentacle_class = tentacles_manager_api.get_tentacle_class_from_string(trading_mode_name)
+    tentacles_manager_api.update_tentacle_config(
+        interfaces_util.get_edited_tentacles_config(),
+        tentacle_class,
+        trading_mode_configuration,
+        keep_existing=False,
+    )
+    _get_distribution_logger().info(
+        f"{trading_mode_name} configuration updated."
+    )
+
+
+def _filter_distribution_0_values(elements: dict) -> dict:
+    return {
+        key: val
+        for key, val in elements.items()
+        if val
+    }
+
+
+def _get_distribution_logger():
+    return bot_logging.get_logger("DistributionConfigurationModel")

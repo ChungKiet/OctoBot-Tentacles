@@ -123,6 +123,13 @@
                 </div>
             </div>
         </div>
+        <div class="text-center mb-3">
+            <a href="{{ url_for('social_data_collector') }}"
+               id="social-data-collector-link"
+               class="btn btn-outline-info waves-effect ml-2">
+                <i class="fa fa-download"></i> Download social data
+            </a>
+        </div>
     </div>
     <div id="collector_operation" class="p-1" style='display: none;'>
         <div id="total_progress_bar_anim-container" class='progress'>
@@ -155,7 +162,7 @@
                 <th scope="col">Symbol(s)</th>
                 <th scope="col">Date of recording</th>
                 <th scope="col">Candles</th>
-                <th scope="col">Exchange</th>
+                <th scope="col">Exchange / Services</th>
                 <th scope="col">Time frame(s)</th>
                 <th scope="col">File</th>
                 <th scope="col">Action</th>
@@ -163,16 +170,24 @@
           </thead>
           <tbody>
             {% for file, description in data_files %}
-                <tr class="selectable_datafile">
+                <tr class="selectable_datafile" data-file-type="{{ description.data_type }}">
                     <td>{{", ".join(description.symbols)}}</td>
                     {% if description.start_timestamp %}
                         <td data-order="{{description.timestamp}}">{{description.start_date}} to {{description.end_date}}</td>
+                        {% if description.data_type == "social" %}
+                        <td>-</td>
+                        {% else %}
                         <td>Full</td>
+                        {% endif %}
                     {% else %}
                         <td data-order="{{description.timestamp}}">{{description.date}}</td>
                         <td>{{description.candles_length}}</td>
                     {% endif %}
+                    {% if description.data_type == "social" %}
+                    <td>{{", ".join(description.services)}}</td>
+                    {% else %}
                     <td>{{description.exchange}}</td>
+                    {% endif %}
                     <td>{{", ".join(description.time_frames)}}</td>
                     <td>{{file}}</td>
                     <td class="text-center">

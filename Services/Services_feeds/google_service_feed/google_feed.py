@@ -52,10 +52,11 @@ class GoogleServiceFeed(service_feeds.AbstractServiceFeed):
     FEED_CHANNEL = GoogleServiceFeedChannel
     REQUIRED_SERVICES = [Services_bases.GoogleService]
 
-    def __init__(self, config, main_async_loop, bot_id):
-        super().__init__(config, main_async_loop, bot_id)
+    def __init__(self, config, main_async_loop, bot_id, backtesting=None, importer=None):
+        super().__init__(config, main_async_loop, bot_id, backtesting=backtesting, importer=importer)
         self.trends_req_builder = None
         self.trends_topics = []
+        self.listener_task = None
 
     def _initialize(self):
         # if the url changes (google sometimes changes it), use the following line:
@@ -116,8 +117,15 @@ class GoogleServiceFeed(service_feeds.AbstractServiceFeed):
 
     async def _start_service_feed(self):
         try:
-            asyncio.create_task(self._update_loop())
+            self.listener_task = asyncio.create_task(self._update_loop())
+            return True
         except Exception as e:
             self.logger.exception(e, True, f"Error when initializing Google trends feed: {e}")
             return False
-        return True
+
+    async def stop(self):
+        await super().stop()
+        if self.listener_task is not None:
+            self.listener_task.cancel()
+            self.listener_task = None
+

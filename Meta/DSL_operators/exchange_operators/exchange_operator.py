@@ -14,17 +14,13 @@
 #
 #  You should have received a copy of the GNU Lesser General Public
 #  License along with this library.
-import octobot_trading.exchanges
-
-import octobot_commons.dsl_interpreter.operators.call_operator as dsl_interpreter_call_operator
-import octobot_trading.modes.script_keywords as script_keywords
+import octobot_commons.dsl_interpreter
 
 
 EXCHANGE_LIBRARY = "exchange"
-UNINITIALIZED_VALUE = object()
 
 
-class ExchangeOperator(dsl_interpreter_call_operator.CallOperator):
+class ExchangeOperator(octobot_commons.dsl_interpreter.PreComputingCallOperator):
 
     @staticmethod
     def get_library() -> str:
@@ -32,9 +28,3 @@ class ExchangeOperator(dsl_interpreter_call_operator.CallOperator):
         Get the library of the operator.
         """
         return EXCHANGE_LIBRARY
-
-    async def get_context(
-        self, exchange_manager: octobot_trading.exchanges.ExchangeManager
-    ) -> script_keywords.Context:
-        # todo later: handle exchange manager without initialized trading modes
-        return script_keywords.get_base_context(next(iter(exchange_manager.trading_modes)))

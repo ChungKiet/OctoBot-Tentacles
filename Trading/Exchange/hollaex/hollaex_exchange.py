@@ -27,6 +27,7 @@ import octobot_trading.enums as trading_enums
 import octobot_trading.constants as trading_constants
 import octobot_trading.exchanges as exchanges
 import octobot_trading.errors as errors
+import octobot_trading.exchanges.connectors.ccxt.constants as ccxt_constants
 import octobot_trading.exchanges.connectors.ccxt.enums as ccxt_enums
 import octobot_trading.exchanges.connectors.ccxt.ccxt_clients_cache as ccxt_clients_cache
 
@@ -57,9 +58,12 @@ class hollaexConnector(exchanges.CCXTConnector):
         if self.exchange_manager.exchange_name not in _REFRESHED_EXCHANGE_FEE_TIERS_BY_EXCHANGE_NAME:
             authenticated_cache = self.exchange_manager.exchange.requires_authentication_for_this_configuration_only()
             # always update fees cache using all markets to avoid market filter side effects from the current client
-            all_markets = ccxt_clients_cache.get_exchange_parsed_markets(
-                ccxt_clients_cache.get_client_key(self.client, authenticated_cache)
-            )
+            if trading_constants.USE_CCXT_SHARED_MARKETS_CACHE:
+                all_markets = list(self.client.markets.values())
+            else:
+                all_markets = ccxt_clients_cache.get_exchange_parsed_markets(
+                    ccxt_clients_cache.get_client_key(self.client, authenticated_cache)
+                )
             await self._refresh_exchange_fee_tiers(all_markets)
 
     async def disable_quick_trade_only_pairs(self):
@@ -437,7 +441,10 @@ class hollaex(exchanges.RestExchange):
 
     def get_additional_connector_config(self):
         return {
-            ccxt_enums.ExchangeColumns.URLS.value: self.get_patched_urls(self.get_api_url())
+            ccxt_enums.ExchangeColumns.URLS.value: self.get_patched_urls(self.get_api_url()),
+            ccxt_constants.CCXT_OPTIONS: {
+                "api-expires": int(trading_constants.DEFAULT_REQUEST_TIMEOUT / 1000)
+            },
         }
 
     def get_api_url(self):
@@ -491,7 +498,7 @@ class hollaex(exchanges.RestExchange):
         return 50
 
     async def get_account_id(self, **kwargs: dict) -> str:
-        with self.connector.error_describer():
+        with self.connector.error_describer(True):
             user_info = await self.connector.client.private_get_user()
             return user_info["id"]
 

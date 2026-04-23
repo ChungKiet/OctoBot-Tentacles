@@ -22,7 +22,9 @@ import tentacles.Services.Interfaces.web_interface.constants as constants
 import tentacles.Services.Interfaces.web_interface.login as login
 import tentacles.Services.Interfaces.web_interface.models as models
 import tentacles.Services.Interfaces.web_interface.util as util
+import tentacles.Services.Interfaces.web_interface.security as security
 import tentacles.Services.Interfaces.web_interface.flask_util as flask_util
+import tentacles.Services.Interfaces.web_interface.enums as enums
 import octobot_trading.api as trading_api
 
 
@@ -51,7 +53,7 @@ def register(blueprint):
             'distributions/market_making/configuration.html',
             selected_exchange=enabled_exchanges[0] if enabled_exchanges else (config_exchanges[0][models.NAME] if config_exchanges else None),
             config_exchanges=config_exchanges,
-            exchanges_schema=models.get_json_exchanges_schema(models.get_tested_exchange_list()),
+            exchanges_schema=models.get_json_exchanges_schema(models.get_tested_exchange_list(), enums.ExchangeConnectionType.API_KEY),
 
             selected_pair=first_symbol_pair,
 
@@ -125,7 +127,7 @@ def register(blueprint):
             if request_data.get("restart_after_save", False):
                 models.schedule_delayed_command(models.restart_bot)
             if next_url is not None:
-                return flask.redirect(next_url)
+                return flask.redirect(security.redirect_target_or(next_url, flask.url_for('configuration')))
             return util.get_rest_reply(flask.jsonify(response))
         else:
             return util.get_rest_reply(flask.jsonify(err_message), 500)
