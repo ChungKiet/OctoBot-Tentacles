@@ -179,7 +179,7 @@ const orders_request_success_callback = (updated_data, update_url, dom_root_elem
     }else{
         create_alert("success", msg, "");
     }
-    debouncedReloadDisplay();
+    reload_orders(true);
 }
 
 const orders_request_failure_callback = (updated_data, update_url, dom_root_element, msg, status) => {
@@ -282,9 +282,12 @@ const reloadDisplay = async (update) => {
     if(!update){
         await reload_pnl(update);
     }
-    await reload_orders(update);
-    await reload_positions(update);
-    if(await reload_trades(update) && update){
+    const [tradesUpdated] = await Promise.all([
+        reload_trades(update),
+        reload_orders(update),
+        reload_positions(update),
+    ]);
+    if(tradesUpdated && update){
         // only update pnl when a new trade appeared
         await reload_pnl(update);
     }
