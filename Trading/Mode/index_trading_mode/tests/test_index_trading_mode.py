@@ -14,6 +14,7 @@
 #  You should have received a copy of the GNU Lesser General Public
 #  License along with this library.
 import time
+import typing
 import pytest
 import pytest_asyncio
 import os.path
@@ -36,7 +37,9 @@ import octobot_tentacles_manager.api as tentacles_manager_api
 import octobot_trading.api as trading_api
 import octobot_trading.exchange_channel as exchanges_channel
 import octobot_trading.exchanges as exchanges
+import octobot_trading.exchange_data as trading_exchange_data
 import octobot_trading.personal_data as trading_personal_data
+import octobot_trading.personal_data.orders.order_util as order_util
 import octobot_trading.enums as trading_enums
 import octobot_trading.constants as trading_constants
 import octobot_trading.modes
@@ -46,6 +49,7 @@ import octobot_trading.signals as trading_signals
 import tentacles.Trading.Mode as Mode
 import tentacles.Trading.Mode.index_trading_mode.index_trading as index_trading
 import tentacles.Trading.Mode.index_trading_mode.index_distribution as index_distribution
+import tentacles.Trading.Mode.index_trading_mode.rebalancer as rebalancer
 
 import tests.test_utils.memory_check_util as memory_check_util
 import tests.test_utils.config as test_utils_config
@@ -54,6 +58,48 @@ import tests.test_utils.test_exchanges as test_exchanges
 # All test coroutines will be treated as marked.
 pytestmark = pytest.mark.asyncio
 
+TRADED_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "ADA/USDT"]
+
+
+def _create_position_mock(
+    symbol,
+    trader,
+    is_futures,
+    is_idle=False,
+    size=decimal.Decimal(0),
+    side=None,
+    position_value=None,
+    initial_margin=decimal.Decimal(0),
+    margin=decimal.Decimal(0),
+):
+
+    position_mock = mock.Mock()
+    position_mock.symbol = symbol
+    
+    if is_idle:
+        position_mock.is_idle.return_value = True
+        position_mock.size = decimal.Decimal(0)
+        position_mock.side = trading_enums.PositionSide.UNKNOWN
+        position_mock.is_long.return_value = False
+        position_mock.is_short.return_value = False
+        position_mock.is_open.return_value = False
+    else:
+        position_mock.is_idle.return_value = False
+        position_mock.size = size
+        position_mock.side = side or trading_enums.PositionSide.LONG
+        position_mock.is_long.return_value = (side == trading_enums.PositionSide.LONG)
+        position_mock.is_short.return_value = (side == trading_enums.PositionSide.SHORT)
+        position_mock.is_open.return_value = True
+    
+    if position_value is not None:
+        position_mock.get_value.return_value = position_value
+    
+    position_mock.initial_margin = initial_margin
+    position_mock.margin = margin
+    position_mock.symbol_contract = trader.exchange_manager.exchange.get_pair_contract(symbol) if is_futures else None
+    
+    return position_mock
+
 
 @pytest_asyncio.fixture
 async def tools():
@@ -61,6 +107,34 @@ async def tools():
     try:
         tentacles_manager_api.reload_tentacle_info()
         mode, trader = await _get_tools()
+        yield mode, trader
+    finally:
+        if trader:
+            await _stop(trader.exchange_manager)
+
+
+@pytest_asyncio.fixture
+async def futures_tools():
+    trader = None
+    try:
+        tentacles_manager_api.reload_tentacle_info()
+        mode, trader = await _get_futures_tools()
+        yield mode, trader
+    finally:
+        if trader:
+            await _stop(trader.exchange_manager)
+
+
+@pytest_asyncio.fixture
+async def trading_tools(request):
+    trader = None
+    try:
+        tentacles_manager_api.reload_tentacle_info()
+        fixture_type = getattr(request, 'param', 'spot')
+        if fixture_type == "futures":
+            mode, trader = await _get_futures_tools()
+        else:
+            mode, trader = await _get_tools()
         yield mode, trader
     finally:
         if trader:
@@ -107,26 +181,31 @@ def _get_config(tools, update):
     config = tentacles_manager_api.get_tentacle_config(trader.exchange_manager.tentacles_setup_config, mode.__class__)
     return {**config, **update}
 
-
-async def test_init_default_values(tools):
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, {}))
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_init_default_values(trading_tools):
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, {}))
     assert mode.refresh_interval_days == 1
     assert mode.rebalance_trigger_min_ratio == decimal.Decimal(str(index_trading.DEFAULT_REBALANCE_TRIGGER_MIN_RATIO))
     assert mode.quote_asset_rebalance_ratio_threshold == decimal.Decimal(str(index_trading.DEFAULT_QUOTE_ASSET_REBALANCE_TRIGGER_MIN_RATIO))
-    assert mode.ratio_per_asset == {'BTC': {'name': 'BTC', 'value': decimal.Decimal(100)}}
+    assert mode.min_order_size_margin == decimal.Decimal("2")
+    assert mode.ratio_per_asset == {'BTC': {'name': 'BTC', 'value': 100.0, 'price': None}}
     assert mode.total_ratio_per_asset == decimal.Decimal(100)
     assert mode.synchronization_policy == index_trading.SynchronizationPolicy.SELL_REMOVED_INDEX_COINS_AS_SOON_AS_POSSIBLE
     assert mode.requires_initializing_appropriate_coins_distribution is False
     assert mode.indexed_coins == ["BTC"]
     assert mode.selected_rebalance_trigger_profile is None
     assert mode.rebalance_trigger_profiles is None
+    assert mode.allow_skip_asset is False
 
 
-async def test_init_config_values(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_init_config_values(trading_tools):
     update = {
         index_trading.IndexTradingModeProducer.REFRESH_INTERVAL: 72,
         index_trading.IndexTradingModeProducer.SYNCHRONIZATION_POLICY: index_trading.SynchronizationPolicy.SELL_REMOVED_INDEX_COINS_ON_RATIO_REBALANCE.value,
         index_trading.IndexTradingModeProducer.REBALANCE_TRIGGER_MIN_PERCENT: 10.2,
+        index_trading.IndexTradingModeProducer.MIN_ORDER_SIZE_MARGIN: 3.5,
+        index_trading.IndexTradingModeProducer.ALLOW_SKIP_ASSET: True,
         index_trading.IndexTradingModeProducer.SELECTED_REBALANCE_TRIGGER_PROFILE: None,
         index_trading.IndexTradingModeProducer.REBALANCE_TRIGGER_PROFILES: [
             {
@@ -154,9 +233,11 @@ async def test_init_config_values(tools):
         ]
     }
     # no selected rebalance trigger profile
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     assert mode.refresh_interval_days == 72
     assert mode.rebalance_trigger_min_ratio == decimal.Decimal("0.102")
+    assert mode.min_order_size_margin == decimal.Decimal("3.5")
+    assert mode.allow_skip_asset is True
     assert mode.selected_rebalance_trigger_profile is None
     assert mode.rebalance_trigger_profiles ==  [
         {
@@ -298,9 +379,10 @@ async def test_init_config_values(tools):
     assert mode.synchronization_policy == index_trading.SynchronizationPolicy.SELL_REMOVED_INDEX_COINS_ON_RATIO_REBALANCE
 
 
-async def test_single_exchange_process_optimize_initial_portfolio(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_single_exchange_process_optimize_initial_portfolio(trading_tools):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
 
     with mock.patch.object(
             octobot_trading.modes, "convert_assets_to_target_asset", mock.AsyncMock(return_value=["order_1"])
@@ -350,7 +432,8 @@ async def test_single_exchange_process_optimize_initial_portfolio(tools):
         convert_assets_to_target_asset_mock.reset_mock()
 
 
-async def test_get_target_ratio_with_config(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_get_target_ratio_with_config(trading_tools):
     update = {
         "refresh_interval": 72,
         "rebalance_trigger_min_percent": 10.2,
@@ -365,7 +448,7 @@ async def test_get_target_ratio_with_config(tools):
             },
         ]
     }
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     assert mode.get_target_ratio("ETH") == decimal.Decimal('0')
     assert mode.get_target_ratio("BTC") == decimal.Decimal("1")  # use 100% BTC as others are not in traded pairs
     assert mode.get_target_ratio("SOL") == decimal.Decimal("0")
@@ -380,9 +463,10 @@ async def test_get_target_ratio_with_config(tools):
     assert mode.get_target_ratio("SOL") == decimal.Decimal("0")
 
 
-async def test_get_target_ratio_without_config(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_get_target_ratio_without_config(trading_tools):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     assert mode.get_target_ratio("ETH") == decimal.Decimal('0')
     assert mode.get_target_ratio("BTC") == decimal.Decimal("1")
     assert mode.get_target_ratio("SOL") == decimal.Decimal("0")
@@ -415,9 +499,10 @@ async def test_get_target_ratio_without_config(tools):
     assert mode.get_target_ratio("SOL") == decimal.Decimal("0.25")
 
 
-async def test_ohlcv_callback(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_ohlcv_callback(trading_tools):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     current_time = time.time()
     with mock.patch.object(producer, "ensure_index", mock.AsyncMock()) as ensure_index_mock, \
         mock.patch.object(producer, "_notify_if_missing_too_many_coins", mock.Mock()) \
@@ -455,9 +540,10 @@ async def test_ohlcv_callback(tools):
             assert producer._last_trigger_time == current_time * 2
 
 
-async def test_notify_if_missing_too_many_coins(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_notify_if_missing_too_many_coins(trading_tools):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     with mock.patch.object(producer.logger, "error", mock.Mock()) as error_mock:
         mode.trading_config[producer.INDEX_CONTENT] = [1, 2, 3, 4, 5]
         mode.indexed_coins = [1, 2, 3, 4, 5]
@@ -481,9 +567,10 @@ async def test_notify_if_missing_too_many_coins(tools):
         error_mock.reset_mock()
 
 
-async def test_ensure_index(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_ensure_index(trading_tools):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     dependencies = trading_signals.get_orders_dependencies([mock.Mock(order_id="123")])
     with mock.patch.object(
             producer, "_wait_for_symbol_prices_and_profitability_init", mock.AsyncMock()
@@ -611,9 +698,10 @@ async def test_ensure_index(tools):
                     _trigger_rebalance_mock.assert_not_called()
 
 
-async def test_cancel_traded_pairs_open_orders_if_any(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_cancel_traded_pairs_open_orders_if_any(trading_tools):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     orders = [
         mock.Mock(symbol="BTC/USDT"),
         mock.Mock(symbol="BTC/USDT"),
@@ -632,9 +720,10 @@ async def test_cancel_traded_pairs_open_orders_if_any(tools):
         assert cancel_order_mock.mock_calls[1].args[0] is orders[1]
 
 
-async def test_trigger_rebalance(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_trigger_rebalance(trading_tools):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     with mock.patch.object(
             producer, "submit_trading_evaluation", mock.AsyncMock()
     ) as _wait_for_symbol_prices_and_profitability_init_mock:
@@ -651,24 +740,50 @@ async def test_trigger_rebalance(tools):
         )
 
 
-async def test_get_rebalance_details(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_get_rebalance_details(trading_tools):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     trader.exchange_manager.exchange_config.traded_symbols = [
         commons_symbols.parse_symbol(symbol)
         for symbol in ["ETH/USDT", "BTC/USDT", "SOL/USDT"]
     ]
     mode.ensure_updated_coins_distribution()
     mode.rebalance_trigger_min_ratio = decimal.Decimal("0.1")
+    is_futures = trader.exchange_manager.is_future
     portfolio_value_holder = trader.exchange_manager.exchange_personal_data.portfolio_manager.portfolio_value_holder
+    positions_manager = trader.exchange_manager.exchange_personal_data.positions_manager
+
     with mock.patch.object(producer, "_resolve_swaps", mock.Mock()) as _resolve_swaps_mock:
         def _get_holdings_ratio(coin, **kwargs):
             if coin == "USDT":
                 return decimal.Decimal("0")
             return decimal.Decimal("0.3")
+        
+        # For futures, positions need to be non-idle with proper values to get ratio 0.3
+        # If total_portfolio_value = 1000, then position_value should be 1000 * 0.3 = 300
+        total_portfolio_value = decimal.Decimal("1000")
+        position_value = total_portfolio_value * decimal.Decimal("0.3")  # 300
+        
+        def _get_symbol_position(symbol, side=None):
+            position_mock = mock.Mock()
+            position_mock.symbol = symbol
+            position_mock.side = side or trading_enums.PositionSide.LONG
+            position_mock.get_value.return_value = position_value
+            position_mock.size = decimal.Decimal("0.3")  # Size for BTC/USDT at ~1000 price
+            position_mock.is_open.return_value = True
+            position_mock.is_idle.return_value = False
+            return position_mock
+        
         with mock.patch.object(
+            positions_manager, "get_symbol_position", mock.Mock(side_effect=_get_symbol_position)
+        ) as get_symbol_position_mock, \
+        mock.patch.object(
             portfolio_value_holder, "get_holdings_ratio", mock.Mock(side_effect=_get_holdings_ratio)
-        ) as get_holdings_ratio_mock:
+        ) as get_holdings_ratio_mock, \
+        mock.patch.object(
+            portfolio_value_holder, "get_traded_assets_holdings_value", mock.Mock(return_value=total_portfolio_value)
+        ) as get_traded_assets_holdings_value_mock:
             with mock.patch.object(
                 mode, "get_removed_coins_from_config", mock.Mock(return_value=[])
             ) as get_removed_coins_from_config_mock:
@@ -687,6 +802,8 @@ async def test_get_rebalance_details(tools):
                 _resolve_swaps_mock.assert_called_once_with(details)
                 _resolve_swaps_mock.reset_mock()
                 get_holdings_ratio_mock.reset_mock()
+                get_symbol_position_mock.reset_mock()
+                get_traded_assets_holdings_value_mock.reset_mock()
             with mock.patch.object(
                     mode, "get_removed_coins_from_config", mock.Mock(return_value=["SOL", "ADA"])
             ) as get_removed_coins_from_config_mock:
@@ -704,18 +821,42 @@ async def test_get_rebalance_details(tools):
                 index_trading.RebalanceDetails.FORCED_REBALANCE.value: False,
                 }
                 assert get_holdings_ratio_mock.call_count == \
-                       len(mode.indexed_coins) + len(details[index_trading.RebalanceDetails.REMOVE.value]) + 1  # +1 for USDT
+                           len(mode.indexed_coins) + len(details[index_trading.RebalanceDetails.REMOVE.value]) + 1  # +1 for USDT
                 get_removed_coins_from_config_mock.assert_called_once()
                 _resolve_swaps_mock.assert_called_once_with(details)
                 _resolve_swaps_mock.reset_mock()
                 get_holdings_ratio_mock.reset_mock()
+                get_symbol_position_mock.reset_mock()
+                get_traded_assets_holdings_value_mock.reset_mock()
         def _get_holdings_ratio(coin, **kwargs):
             if coin == "USDT":
                 return decimal.Decimal("0")
             return decimal.Decimal("0.2")
+        
+        # For futures, positions need to be non-idle with proper values to get ratio 0.2 (below target, so triggers BUY_MORE)
+        # If total_portfolio_value = 1000, then position_value should be 1000 * 0.2 = 200
+        total_portfolio_value_2 = decimal.Decimal("1000")
+        position_value_2 = total_portfolio_value_2 * decimal.Decimal("0.2")  # 200
+        
+        def _get_symbol_position(symbol, side=None):
+            position_mock = mock.Mock()
+            position_mock.symbol = symbol
+            position_mock.side = side or trading_enums.PositionSide.LONG
+            position_mock.get_value.return_value = position_value_2
+            position_mock.size = decimal.Decimal("0.2")  # Size for BTC/USDT at ~1000 price
+            position_mock.is_open.return_value = True
+            position_mock.is_idle.return_value = False
+            return position_mock
+        
         with mock.patch.object(
+            positions_manager, "get_symbol_position", mock.Mock(side_effect=_get_symbol_position)
+        ) as get_symbol_position_mock, \
+        mock.patch.object(
                 portfolio_value_holder, "get_holdings_ratio", mock.Mock(side_effect=_get_holdings_ratio)
-        ) as get_holdings_ratio_mock:
+        ) as get_holdings_ratio_mock, \
+        mock.patch.object(
+            portfolio_value_holder, "get_traded_assets_holdings_value", mock.Mock(return_value=total_portfolio_value_2)
+        ) as get_traded_assets_holdings_value_mock_2:
             with mock.patch.object(
                     mode, "get_removed_coins_from_config", mock.Mock(return_value=[])
             ) as get_removed_coins_from_config_mock:
@@ -738,6 +879,8 @@ async def test_get_rebalance_details(tools):
                 _resolve_swaps_mock.assert_called_once_with(details)
                 _resolve_swaps_mock.reset_mock()
                 get_holdings_ratio_mock.reset_mock()
+                get_symbol_position_mock.reset_mock()
+                get_traded_assets_holdings_value_mock_2.reset_mock()
             with mock.patch.object(
                     mode, "get_removed_coins_from_config", mock.Mock(return_value=["SOL", "ADA"])
             ) as get_removed_coins_from_config_mock:
@@ -759,21 +902,44 @@ async def test_get_rebalance_details(tools):
                 index_trading.RebalanceDetails.FORCED_REBALANCE.value: False,
                 }
                 assert get_holdings_ratio_mock.call_count == \
-                       len(mode.indexed_coins) + len(details[index_trading.RebalanceDetails.REMOVE.value]) + 1  # +1 for USDT
+                           len(mode.indexed_coins) + len(details[index_trading.RebalanceDetails.REMOVE.value]) + 1  # +1 for USDT
                 get_removed_coins_from_config_mock.assert_called_once()
                 _resolve_swaps_mock.assert_called_once_with(details)
                 _resolve_swaps_mock.reset_mock()
                 get_holdings_ratio_mock.reset_mock()
+                get_symbol_position_mock.reset_mock()
 
         # rebalance cap larger than ratio
         def _get_holdings_ratio(coin, **kwargs):
             if coin == "USDT":
                 return decimal.Decimal("0")
             return decimal.Decimal("0.3")
+        
+        # For futures, positions need to have proper values to get ratio 0.3 (within acceptable range)
+        # If total_portfolio_value = 1000, then position_value should be 1000 * 0.3 = 300
+        total_portfolio_value_rebalance_cap = decimal.Decimal("1000")
+        position_value_rebalance_cap = total_portfolio_value_rebalance_cap * decimal.Decimal("0.3")  # 300
+        
+        def _get_symbol_position(symbol, side=None):
+            position_mock = mock.Mock()
+            position_mock.symbol = symbol
+            position_mock.side = side or trading_enums.PositionSide.LONG
+            position_mock.get_value.return_value = position_value_rebalance_cap
+            position_mock.size = decimal.Decimal("0.3")  # Size for BTC/USDT at ~1000 price
+            position_mock.is_open.return_value = True
+            position_mock.is_idle.return_value = False
+            return position_mock
+        
         mode.rebalance_trigger_min_ratio = decimal.Decimal("0.5")
         with mock.patch.object(
+            positions_manager, "get_symbol_position", mock.Mock(side_effect=_get_symbol_position)
+        ) as get_symbol_position_mock, \
+        mock.patch.object(
                 portfolio_value_holder, "get_holdings_ratio", mock.Mock(side_effect=_get_holdings_ratio)
-        ) as get_holdings_ratio_mock:
+        ) as get_holdings_ratio_mock, \
+        mock.patch.object(
+            portfolio_value_holder, "get_traded_assets_holdings_value", mock.Mock(return_value=total_portfolio_value_rebalance_cap)
+        ) as get_traded_assets_holdings_value_mock:
             should_rebalance, details = producer._get_rebalance_details()
             assert should_rebalance is False
             assert details == {
@@ -786,15 +952,39 @@ async def test_get_rebalance_details(tools):
             }
             assert get_holdings_ratio_mock.call_count == len(mode.indexed_coins) + 1  # +1 for USDT
             get_holdings_ratio_mock.reset_mock()
+            get_symbol_position_mock.reset_mock()
+            get_traded_assets_holdings_value_mock.reset_mock()
             _resolve_swaps_mock.assert_called_once_with(details)
             _resolve_swaps_mock.reset_mock()
         def _get_holdings_ratio(coin, **kwargs):
             if coin == "USDT":
                 return decimal.Decimal("0")
             return decimal.Decimal("0.00000001")
+        
+        # For futures, positions need to have proper values to get ratio 0.00000001 (within acceptable range)
+        # If total_portfolio_value = 1000, then position_value should be 1000 * 0.00000001 = 0.00001
+        total_portfolio_value_small = decimal.Decimal("1000")
+        position_value_small = total_portfolio_value_small * decimal.Decimal("0.00000001")  # 0.00001
+        
+        def _get_symbol_position_small(symbol, side=None):
+            position_mock = mock.Mock()
+            position_mock.symbol = symbol
+            position_mock.side = side or trading_enums.PositionSide.LONG
+            position_mock.get_value.return_value = position_value_small
+            position_mock.size = decimal.Decimal("0.00000001")  # Very small size
+            position_mock.is_open.return_value = True
+            position_mock.is_idle.return_value = False
+            return position_mock
+        
         with mock.patch.object(
+                positions_manager, "get_symbol_position", mock.Mock(side_effect=_get_symbol_position_small)
+        ) as get_symbol_position_mock, \
+        mock.patch.object(
                 portfolio_value_holder, "get_holdings_ratio", mock.Mock(side_effect=_get_holdings_ratio)
-        ) as get_holdings_ratio_mock:
+        ) as get_holdings_ratio_mock, \
+        mock.patch.object(
+            portfolio_value_holder, "get_traded_assets_holdings_value", mock.Mock(return_value=total_portfolio_value_small)
+        ) as get_traded_assets_holdings_value_mock:
             should_rebalance, details = producer._get_rebalance_details()
             assert should_rebalance is False
             assert details == {
@@ -807,15 +997,39 @@ async def test_get_rebalance_details(tools):
             }
             assert get_holdings_ratio_mock.call_count == len(mode.indexed_coins) + 1  # +1 for USDT
             get_holdings_ratio_mock.reset_mock()
+            get_symbol_position_mock.reset_mock()
+            get_traded_assets_holdings_value_mock.reset_mock()
             _resolve_swaps_mock.assert_called_once_with(details)
             _resolve_swaps_mock.reset_mock()
         def _get_holdings_ratio(coin, **kwargs):
             if coin == "USDT":
                 return decimal.Decimal("0")
             return decimal.Decimal("0.9")
+        
+        # For futures, positions need to have proper values to get ratio 0.9 (above target, so triggers SELL_SOME)
+        # If total_portfolio_value = 1000, then position_value should be 1000 * 0.9 = 900
+        total_portfolio_value_high = decimal.Decimal("1000")
+        position_value_high = total_portfolio_value_high * decimal.Decimal("0.9")  # 900
+        
+        def _get_symbol_position(symbol, side=None):
+            position_mock = mock.Mock()
+            position_mock.symbol = symbol
+            position_mock.side = side or trading_enums.PositionSide.LONG
+            position_mock.get_value.return_value = position_value_high
+            position_mock.size = decimal.Decimal("0.9")  # Size for BTC/USDT at ~1000 price
+            position_mock.is_open.return_value = True
+            position_mock.is_idle.return_value = False
+            return position_mock
+        
         with mock.patch.object(
+            positions_manager, "get_symbol_position", mock.Mock(side_effect=_get_symbol_position)
+        ) as get_symbol_position_mock, \
+        mock.patch.object(
                 portfolio_value_holder, "get_holdings_ratio", mock.Mock(side_effect=_get_holdings_ratio)
-        ) as get_holdings_ratio_mock:
+        ) as get_holdings_ratio_mock, \
+        mock.patch.object(
+            portfolio_value_holder, "get_traded_assets_holdings_value", mock.Mock(return_value=total_portfolio_value_high)
+        ) as get_traded_assets_holdings_value_mock:
             should_rebalance, details = producer._get_rebalance_details()
             assert should_rebalance is True
             assert details == {
@@ -832,11 +1046,27 @@ async def test_get_rebalance_details(tools):
             }
             assert get_holdings_ratio_mock.call_count == len(details[index_trading.RebalanceDetails.SELL_SOME.value]) + 1  # +1 for USDT
             get_holdings_ratio_mock.reset_mock()
+            get_symbol_position_mock.reset_mock()
+            get_traded_assets_holdings_value_mock.reset_mock()
             _resolve_swaps_mock.assert_called_once_with(details)
             _resolve_swaps_mock.reset_mock()
         def _get_holdings_ratio(coin, **kwargs):
             return decimal.Decimal("0")
+        
+        def _get_symbol_position(symbol, side=None):
+            position_mock = mock.Mock()
+            position_mock.symbol = symbol
+            position_mock.side = side or trading_enums.PositionSide.LONG
+            position_mock.get_value.return_value = decimal.Decimal("0")
+            position_mock.size = decimal.Decimal("0")
+            position_mock.is_open.return_value = False
+            position_mock.is_idle.return_value = True
+            return position_mock
+        
         with mock.patch.object(
+            positions_manager, "get_symbol_position", mock.Mock(side_effect=_get_symbol_position)
+        ) as get_symbol_position_mock, \
+        mock.patch.object(
                 portfolio_value_holder, "get_holdings_ratio", mock.Mock(side_effect=_get_holdings_ratio)
         ) as get_holdings_ratio_mock:
             should_rebalance, details = producer._get_rebalance_details()
@@ -854,7 +1084,9 @@ async def test_get_rebalance_details(tools):
                 index_trading.RebalanceDetails.FORCED_REBALANCE.value: False,
             }
             assert get_holdings_ratio_mock.call_count == len(details[index_trading.RebalanceDetails.ADD.value]) + 1  # +1 for USDT
+            get_traded_assets_holdings_value_mock.reset_mock()
             get_holdings_ratio_mock.reset_mock()
+            get_symbol_position_mock.reset_mock()
             _resolve_swaps_mock.assert_called_once_with(details)
             _resolve_swaps_mock.reset_mock()
 
@@ -863,9 +1095,39 @@ async def test_get_rebalance_details(tools):
             if coin == "ETH":
                 return decimal.Decimal("0")
             return decimal.Decimal("0.33")
+        
+        # For futures, positions need to have proper values: ETH should be idle (0), BTC and SOL should have ratio 0.33
+        # If total_portfolio_value = 1000, then position_value for BTC/SOL should be 1000 * 0.33 = 330
+        total_portfolio_value_eth_only = decimal.Decimal("1000")
+        position_value_eth_only = total_portfolio_value_eth_only * decimal.Decimal("0.33")  # 330
+        
+        def _get_symbol_position(symbol, side=None):
+            position_mock = mock.Mock()
+            position_mock.symbol = symbol
+            position_mock.side = side or trading_enums.PositionSide.LONG
+            # ETH should be idle (ratio 0), BTC and SOL should have proper values (ratio 0.33)
+            if "ETH" in symbol:
+                position_mock.get_value.return_value = decimal.Decimal("0")
+                position_mock.size = decimal.Decimal("0")
+                position_mock.is_open.return_value = False
+                position_mock.is_idle.return_value = True
+            else:
+                # BTC and SOL have proper positions
+                position_mock.get_value.return_value = position_value_eth_only
+                position_mock.size = decimal.Decimal("0.33")  # Size for BTC/USDT or SOL/USDT at ~1000 price
+                position_mock.is_open.return_value = True
+                position_mock.is_idle.return_value = False
+            return position_mock
+        
         with mock.patch.object(
+            positions_manager, "get_symbol_position", mock.Mock(side_effect=_get_symbol_position)
+        ) as get_symbol_position_mock, \
+        mock.patch.object(
             portfolio_value_holder, "get_holdings_ratio", mock.Mock(side_effect=_get_holdings_ratio)
-        ) as get_holdings_ratio_mock:
+        ) as get_holdings_ratio_mock, \
+        mock.patch.object(
+            portfolio_value_holder, "get_traded_assets_holdings_value", mock.Mock(return_value=total_portfolio_value_eth_only)
+        ) as get_traded_assets_holdings_value_mock:
             should_rebalance, details = producer._get_rebalance_details()
             assert should_rebalance is True
             assert details == {
@@ -880,12 +1142,15 @@ async def test_get_rebalance_details(tools):
             }
             assert get_holdings_ratio_mock.call_count == 3 + 1  # called for each coin + 1 for USDT
             get_holdings_ratio_mock.reset_mock()
+            get_symbol_position_mock.reset_mock()
+            get_traded_assets_holdings_value_mock.reset_mock()
             _resolve_swaps_mock.assert_called_once_with(details)
             _resolve_swaps_mock.reset_mock()
         
-async def test_get_rebalance_details_with_usdt_without_coin_distribution_update(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_get_rebalance_details_with_usdt_without_coin_distribution_update(trading_tools):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     trader.exchange_manager.exchange_config.traded_symbols = [
         commons_symbols.parse_symbol(symbol)
         for symbol in ["ETH/USDT", "BTC/USDT", "SOL/USDT"]
@@ -893,7 +1158,9 @@ async def test_get_rebalance_details_with_usdt_without_coin_distribution_update(
     mode.ensure_updated_coins_distribution()
     mode.rebalance_trigger_min_ratio = decimal.Decimal("0.1")
     mode.synchronization_policy = index_trading.SynchronizationPolicy.SELL_REMOVED_INDEX_COINS_AS_SOON_AS_POSSIBLE
+    is_futures = trader.exchange_manager.is_future
     portfolio_value_holder = trader.exchange_manager.exchange_personal_data.portfolio_manager.portfolio_value_holder
+
     with mock.patch.object(producer, "_resolve_swaps", mock.Mock()) as _resolve_swaps_mock, \
         mock.patch.object(mode, "ensure_updated_coins_distribution", mock.Mock()) as ensure_updated_coins_distribution_mock:
         def _get_holdings_ratio(coin, **kwargs):
@@ -903,40 +1170,73 @@ async def test_get_rebalance_details_with_usdt_without_coin_distribution_update(
             # other coins are 2/3 of the portfolio
             return decimal.Decimal("0.33") * decimal.Decimal("2") / decimal.Decimal("3")
 
-        # with added USDT to the portfolio
+        # Mock positions for futures - create positions for BTC, ETH, SOL
+        # For futures rebalancer: ratio = position_value / total_portfolio_value
+        # We want ratio = 0.22 (which is 0.33 * 2 / 3) to trigger BUY_MORE
+        # If total_portfolio_value = 2000, then position_value should be 2000 * 0.22 = 440
+        total_portfolio_value = decimal.Decimal("2000")
+        target_coin_ratio = decimal.Decimal("0.33") * decimal.Decimal("2") / decimal.Decimal("3")  # 0.22
+        position_value = total_portfolio_value * target_coin_ratio  # 440
+        
+        def _get_symbol_position(symbol, side=None):
+            position_mock = mock.Mock()
+            position_mock.symbol = symbol
+            position_mock.side = side or trading_enums.PositionSide.LONG
+            # Set position value to give ratio of 0.22 (below target of 0.333, so triggers BUY_MORE)
+            position_mock.get_value.return_value = position_value
+            position_mock.size = decimal.Decimal("1.33")  # Size for BTC/USDT at ~1000 price
+            position_mock.is_open.return_value = True
+            position_mock.is_idle.return_value = False
+            return position_mock
+
+        expected_details = {
+            index_trading.RebalanceDetails.SELL_SOME.value: {},
+            index_trading.RebalanceDetails.BUY_MORE.value: {
+                'BTC': decimal.Decimal('0.3333333333333333617834929233'),
+                'ETH': decimal.Decimal('0.3333333333333333617834929233'),
+                'SOL': decimal.Decimal('0.3333333333333333617834929233')
+            },
+            index_trading.RebalanceDetails.REMOVE.value: {},
+            index_trading.RebalanceDetails.ADD.value: {},
+            index_trading.RebalanceDetails.SWAP.value: {},
+            index_trading.RebalanceDetails.FORCED_REBALANCE.value: True,
+        }
+        
+        positions_manager = trader.exchange_manager.exchange_personal_data.positions_manager
         with mock.patch.object(
+            positions_manager, "get_symbol_position", mock.Mock(side_effect=_get_symbol_position)
+        ) as get_symbol_position_mock, \
+        mock.patch.object(
             portfolio_value_holder, "get_holdings_ratio", mock.Mock(side_effect=_get_holdings_ratio)
-        ) as get_holdings_ratio_mock:
+        ) as get_holdings_ratio_mock, \
+        mock.patch.object(
+            portfolio_value_holder, "get_traded_assets_holdings_value", mock.Mock(return_value=total_portfolio_value)
+        ) as get_traded_assets_holdings_value_mock:
             should_rebalance, details = producer._get_rebalance_details()
             assert should_rebalance is True
-            assert details == {
-                index_trading.RebalanceDetails.SELL_SOME.value: {},
-                index_trading.RebalanceDetails.BUY_MORE.value: {
-                    'BTC': decimal.Decimal('0.3333333333333333617834929233'),
-                    'ETH': decimal.Decimal('0.3333333333333333617834929233'),
-                    'SOL': decimal.Decimal('0.3333333333333333617834929233')
-                },
-                index_trading.RebalanceDetails.REMOVE.value: {},
-                index_trading.RebalanceDetails.ADD.value: {},
-                index_trading.RebalanceDetails.SWAP.value: {},
-                index_trading.RebalanceDetails.FORCED_REBALANCE.value: True,
-            }
-            assert get_holdings_ratio_mock.call_count == len(mode.indexed_coins) + 1  # called to check non-indexed assets ratio
+            assert details == expected_details
+            assert get_holdings_ratio_mock.call_count == len(mode.indexed_coins) + 1  # called for each coin + 1 for USDT
             ensure_updated_coins_distribution_mock.assert_not_called()
             get_holdings_ratio_mock.reset_mock()
+            get_symbol_position_mock.reset_mock()
+            get_traded_assets_holdings_value_mock.reset_mock()
             _resolve_swaps_mock.assert_not_called()
             _resolve_swaps_mock.reset_mock()
+    
         
-async def test_get_rebalance_details_with_usdt_and_coin_distribution_update(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_get_rebalance_details_with_usdt_and_coin_distribution_update(trading_tools):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     trader.exchange_manager.exchange_config.traded_symbols = [
         commons_symbols.parse_symbol(symbol)
         for symbol in ["ETH/USDT", "BTC/USDT", "SOL/USDT"]
     ]
     mode.ensure_updated_coins_distribution()
     mode.rebalance_trigger_min_ratio = decimal.Decimal("0.1")
+    is_futures = trader.exchange_manager.is_future
     portfolio_value_holder = trader.exchange_manager.exchange_personal_data.portfolio_manager.portfolio_value_holder
+    positions_manager = trader.exchange_manager.exchange_personal_data.positions_manager
     mode.synchronization_policy = index_trading.SynchronizationPolicy.SELL_REMOVED_INDEX_COINS_ON_RATIO_REBALANCE
     with mock.patch.object(producer, "_resolve_swaps", mock.Mock()) as _resolve_swaps_mock, \
         mock.patch.object(mode, "ensure_updated_coins_distribution", mock.Mock()) as ensure_updated_coins_distribution_mock:
@@ -947,10 +1247,35 @@ async def test_get_rebalance_details_with_usdt_and_coin_distribution_update(tool
             # other coins are 2/3 of the portfolio
             return decimal.Decimal("0.33") * decimal.Decimal("2") / decimal.Decimal("3")
 
+        # Mock positions for futures - create positions for BTC, ETH, SOL
+        # For futures rebalancer: ratio = position_value / total_portfolio_value
+        # We want ratio = 0.22 (which is 0.33 * 2 / 3) to trigger BUY_MORE
+        # If total_portfolio_value = 2000, then position_value should be 2000 * 0.22 = 440
+        total_portfolio_value = decimal.Decimal("2000")
+        target_coin_ratio = decimal.Decimal("0.33") * decimal.Decimal("2") / decimal.Decimal("3")  # 0.22
+        position_value = total_portfolio_value * target_coin_ratio  # 440
+
+        def _get_symbol_position(symbol, side=None):
+            position_mock = mock.Mock()
+            position_mock.symbol = symbol
+            position_mock.side = side or trading_enums.PositionSide.LONG
+            # Set position value to give ratio of 0.22 (below target of 0.333, so triggers BUY_MORE)
+            position_mock.get_value.return_value = position_value
+            position_mock.size = decimal.Decimal("1.33")  # Size for BTC/USDT at ~1000 price
+            position_mock.is_open.return_value = True
+            position_mock.is_idle.return_value = False
+            return position_mock
+
         # with added USDT to the portfolio
         with mock.patch.object(
+            positions_manager, "get_symbol_position", mock.Mock(side_effect=_get_symbol_position)
+        ) as get_symbol_position_mock, \
+        mock.patch.object(
             portfolio_value_holder, "get_holdings_ratio", mock.Mock(side_effect=_get_holdings_ratio)
-        ) as get_holdings_ratio_mock:
+        ) as get_holdings_ratio_mock, \
+        mock.patch.object(
+            portfolio_value_holder, "get_traded_assets_holdings_value", mock.Mock(return_value=total_portfolio_value)
+        ) as get_traded_assets_holdings_value_mock:
             should_rebalance, details = producer._get_rebalance_details()
             assert should_rebalance is True
             assert details == {
@@ -965,17 +1290,19 @@ async def test_get_rebalance_details_with_usdt_and_coin_distribution_update(tool
                 index_trading.RebalanceDetails.SWAP.value: {},
                 index_trading.RebalanceDetails.FORCED_REBALANCE.value: True,
             }
-            # 2 x called to check non-indexed assets ratio (once for current and one for latest distribution)
             assert get_holdings_ratio_mock.call_count == 2 * (len(mode.indexed_coins) + 1)  
             ensure_updated_coins_distribution_mock.assert_called_once()
             get_holdings_ratio_mock.reset_mock()
+            get_symbol_position_mock.reset_mock()
+            get_traded_assets_holdings_value_mock.reset_mock()
             _resolve_swaps_mock.assert_not_called()
             _resolve_swaps_mock.reset_mock()
 
 
-async def test_should_rebalance_due_to_non_indexed_quote_assets_ratio(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_should_rebalance_due_to_non_indexed_quote_assets_ratio(trading_tools):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     assert mode.quote_asset_rebalance_ratio_threshold == decimal.Decimal("0.1")
     rebalance_details = {
         index_trading.RebalanceDetails.SELL_SOME.value: {},
@@ -1028,9 +1355,79 @@ async def test_should_rebalance_due_to_non_indexed_quote_assets_ratio(tools):
     assert producer._should_rebalance_due_to_non_indexed_quote_assets_ratio(decimal.Decimal("0.03"), rebalance_details) is False  # bellow threshold: still false
 
 
-async def test_get_removed_coins_from_config_sell_removed_coins_asap(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_get_non_indexed_quote_assets_ratio_with_reference_market_ratio(trading_tools):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
+    ref_market = trader.exchange_manager.exchange_personal_data.portfolio_manager.reference_market
+    portfolio_value_holder = trader.exchange_manager.exchange_personal_data.portfolio_manager.portfolio_value_holder
+
+    def _get_holdings_ratio_usdt_15(coin, **kwargs):
+        return decimal.Decimal("0.15") if coin == ref_market else decimal.Decimal("0")
+
+    def _get_holdings_ratio_usdt_08(coin, **kwargs):
+        return decimal.Decimal("0.08") if coin == ref_market else decimal.Decimal("0")
+
+    def _get_holdings_ratio_usdt_95(coin, **kwargs):
+        return decimal.Decimal("0.95") if coin == ref_market else decimal.Decimal("0")
+
+    def _get_holdings_ratio_usdt_92(coin, **kwargs):
+        return decimal.Decimal("0.92") if coin == ref_market else decimal.Decimal("0")
+
+    with mock.patch.object(portfolio_value_holder, "get_holdings_ratio", mock.Mock(side_effect=_get_holdings_ratio_usdt_15)):
+        mode.reference_market_ratio = trading_constants.ZERO
+        assert producer._get_non_indexed_quote_assets_ratio() == decimal.Decimal("0.15")
+
+    with mock.patch.object(portfolio_value_holder, "get_holdings_ratio", mock.Mock(side_effect=_get_holdings_ratio_usdt_15)):
+        mode.reference_market_ratio = decimal.Decimal("0.1")
+        # reference_market_ratio=10% means 90% should be kept, so excess = 15% - 90% = -75% = 0
+        assert producer._get_non_indexed_quote_assets_ratio() == decimal.Decimal("0")
+
+    with mock.patch.object(portfolio_value_holder, "get_holdings_ratio", mock.Mock(side_effect=_get_holdings_ratio_usdt_08)):
+        mode.reference_market_ratio = decimal.Decimal("0.1")
+        # reference_market_ratio=10% means 90% should be kept, so excess = 8% - 90% = -82% = 0
+        assert producer._get_non_indexed_quote_assets_ratio() == decimal.Decimal("0")
+
+    with mock.patch.object(portfolio_value_holder, "get_holdings_ratio", mock.Mock(side_effect=_get_holdings_ratio_usdt_95)):
+        mode.reference_market_ratio = decimal.Decimal("0.1")
+        # reference_market_ratio=10% means 90% should be kept, so excess = 95% - 90% = 5%
+        assert producer._get_non_indexed_quote_assets_ratio() == decimal.Decimal("0.05")
+
+    with mock.patch.object(portfolio_value_holder, "get_holdings_ratio", mock.Mock(side_effect=_get_holdings_ratio_usdt_92)):
+        mode.reference_market_ratio = decimal.Decimal("0.1")
+        # reference_market_ratio=10% means 90% should be kept, so excess = 92% - 90% = 2%
+        assert producer._get_non_indexed_quote_assets_ratio() == decimal.Decimal("0.02")
+
+    rebalance_details = {
+        index_trading.RebalanceDetails.SELL_SOME.value: {},
+        index_trading.RebalanceDetails.BUY_MORE.value: {},
+        index_trading.RebalanceDetails.REMOVE.value: {},
+        index_trading.RebalanceDetails.ADD.value: {},
+        index_trading.RebalanceDetails.SWAP.value: {},
+        index_trading.RebalanceDetails.FORCED_REBALANCE.value: False,
+    }
+
+    # USDT=15%, threshold 10%: without reference_market_ratio -> 15% >= 10% -> forces rebalance
+    with mock.patch.object(portfolio_value_holder, "get_holdings_ratio", mock.Mock(side_effect=_get_holdings_ratio_usdt_15)):
+        mode.reference_market_ratio = trading_constants.ZERO
+        mode.quote_asset_rebalance_ratio_threshold = decimal.Decimal("0.1")
+        details = {k: ({}.copy() if isinstance(v, dict) else v) for k, v in rebalance_details.items()}
+        assert producer._register_quote_asset_rebalance(details) is True
+        assert details[index_trading.RebalanceDetails.FORCED_REBALANCE.value] is True
+
+    # reference_market_ratio=10% means 90% should be kept, USDT=15% -> excess = 15% - 90% = -75% = 0; threshold 10% -> no forced rebalance
+    with mock.patch.object(portfolio_value_holder, "get_holdings_ratio", mock.Mock(side_effect=_get_holdings_ratio_usdt_15)):
+        mode.reference_market_ratio = decimal.Decimal("0.1")
+        mode.quote_asset_rebalance_ratio_threshold = decimal.Decimal("0.1")
+        details = {k: ({}.copy() if isinstance(v, dict) else v) for k, v in rebalance_details.items()}
+        assert producer._register_quote_asset_rebalance(details) is False
+        assert details[index_trading.RebalanceDetails.FORCED_REBALANCE.value] is False
+
+
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_get_removed_coins_from_config_sell_removed_coins_asap(trading_tools):
+    update = {}
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     mode.synchronization_policy = index_trading.SynchronizationPolicy.SELL_REMOVED_INDEX_COINS_AS_SOON_AS_POSSIBLE
     mode.sell_unindexed_traded_coins = False
     assert mode.get_removed_coins_from_config([]) == []
@@ -1084,9 +1481,10 @@ async def test_get_removed_coins_from_config_sell_removed_coins_asap(tools):
     assert sorted(mode.get_removed_coins_from_config(["BTC", "ETH"])) == sorted(["ETH", "BB"])
 
 
-async def test_get_removed_coins_from_config_sell_removed_on_ratio_rebalance(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_get_removed_coins_from_config_sell_removed_on_ratio_rebalance(trading_tools):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     mode.synchronization_policy = index_trading.SynchronizationPolicy.SELL_REMOVED_INDEX_COINS_ON_RATIO_REBALANCE
     mode.sell_unindexed_traded_coins = False
     assert mode.get_removed_coins_from_config([]) == []
@@ -1150,9 +1548,10 @@ async def test_get_removed_coins_from_config_sell_removed_on_ratio_rebalance(too
         assert sorted(mode.get_removed_coins_from_config(["BTC", "ETH"])) == sorted(['ADA', 'DOT'])
 
 
-async def test_create_new_orders(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_create_new_orders(trading_tools):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     with mock.patch.object(
             consumer, "_rebalance_portfolio", mock.AsyncMock(return_value="plop")
     ) as _rebalance_portfolio_mock:
@@ -1170,14 +1569,15 @@ async def test_create_new_orders(tools):
         assert mode.is_processing_rebalance is False
 
 
-async def test_rebalance_portfolio(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_rebalance_portfolio(trading_tools):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     sell_order = mock.Mock(order_id="456")
     with mock.patch.object(
             consumer, "_ensure_enough_funds_to_buy_after_selling", mock.AsyncMock()
     ) as _ensure_enough_funds_to_buy_after_selling_mock, mock.patch.object(
-        consumer, "_sell_indexed_coins_for_reference_market", mock.AsyncMock(return_value=[sell_order])
+        consumer.trading_mode.rebalancer, "sell_indexed_coins_for_reference_market", mock.AsyncMock(return_value=[sell_order])
     ) as _sell_indexed_coins_for_reference_market_mock, mock.patch.object(
         consumer, "_split_reference_market_into_indexed_coins", mock.AsyncMock(return_value=["buy"])
     ) as _split_reference_market_into_indexed_coins_mock:
@@ -1207,7 +1607,7 @@ async def test_rebalance_portfolio(tools):
         with mock.patch.object(
                 consumer, "_ensure_enough_funds_to_buy_after_selling", mock.AsyncMock()
         ) as _ensure_enough_funds_to_buy_after_selling_mock, mock.patch.object(
-            consumer, "_sell_indexed_coins_for_reference_market", mock.AsyncMock(
+            consumer.trading_mode.rebalancer, "sell_indexed_coins_for_reference_market", mock.AsyncMock(
                 side_effect=trading_errors.MissingMinimalExchangeTradeVolume
             )
         ) as _sell_indexed_coins_for_reference_market_mock, mock.patch.object(
@@ -1232,7 +1632,7 @@ async def test_rebalance_portfolio(tools):
             )
         ) as _ensure_enough_funds_to_buy_after_selling_mock, \
             mock.patch.object(
-                consumer, "_sell_indexed_coins_for_reference_market", mock.AsyncMock(return_value=[sell_order])
+                consumer.trading_mode.rebalancer, "sell_indexed_coins_for_reference_market", mock.AsyncMock(return_value=[sell_order])
         ) as _sell_indexed_coins_for_reference_market_mock, mock.patch.object(
             consumer, "_split_reference_market_into_indexed_coins", mock.AsyncMock(return_value=["buy"])
         ) as _split_reference_market_into_indexed_coins_mock, mock.patch.object(
@@ -1253,7 +1653,7 @@ async def test_rebalance_portfolio(tools):
             consumer, "_ensure_enough_funds_to_buy_after_selling", mock.AsyncMock()
         ) as _ensure_enough_funds_to_buy_after_selling_mock, \
         mock.patch.object(
-            consumer, "_sell_indexed_coins_for_reference_market", mock.AsyncMock(return_value=[sell_order])
+            consumer.trading_mode.rebalancer, "sell_indexed_coins_for_reference_market", mock.AsyncMock(return_value=[sell_order])
         ) as _sell_indexed_coins_for_reference_market_mock, mock.patch.object(
             consumer, "_split_reference_market_into_indexed_coins", mock.AsyncMock(
                 side_effect=trading_errors.MissingMinimalExchangeTradeVolume
@@ -1294,10 +1694,10 @@ async def test_rebalance_portfolio(tools):
             consumer, "_ensure_enough_funds_to_buy_after_selling", mock.AsyncMock()
         ) as _ensure_enough_funds_to_buy_after_selling_mock, \
         mock.patch.object(
-            consumer, "_sell_indexed_coins_for_reference_market", mock.AsyncMock(return_value=[sell_order])
+            consumer.trading_mode.rebalancer, "sell_indexed_coins_for_reference_market", mock.AsyncMock(return_value=[sell_order])
         ) as _sell_indexed_coins_for_reference_market_mock, mock.patch.object(
             consumer, "_split_reference_market_into_indexed_coins", mock.AsyncMock(
-                side_effect=index_trading.RebalanceAborted
+                side_effect=rebalancer.RebalanceAborted
             )
         ) as _split_reference_market_into_indexed_coins_mock:
             with mock.patch.object(
@@ -1332,9 +1732,10 @@ async def test_rebalance_portfolio(tools):
                 _update_producer_last_activity_mock.reset_mock()
 
 
-async def test_ensure_enough_funds_to_buy_after_selling(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_ensure_enough_funds_to_buy_after_selling(trading_tools):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     with mock.patch.object(
             trader.exchange_manager.exchange_personal_data.portfolio_manager.portfolio_value_holder,
             "get_traded_assets_holdings_value", mock.Mock(return_value=decimal.Decimal("2000"))
@@ -1343,12 +1744,13 @@ async def test_ensure_enough_funds_to_buy_after_selling(tools):
     ) as _get_symbols_and_amounts_mock:
         await consumer._ensure_enough_funds_to_buy_after_selling()
         get_traded_assets_holdings_value_mock.assert_called_once_with("USDT", None)
-        _get_symbols_and_amounts_mock.assert_called_once_with(["BTC"], decimal.Decimal("2000"))
+        _get_symbols_and_amounts_mock.assert_called_once_with(["BTC"], mode.indexed_coins_prices, decimal.Decimal("2000"))
 
 
-async def test_can_simply_buy_coins_without_selling(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_can_simply_buy_coins_without_selling(trading_tools):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     details = "details"
     with mock.patch.object(
         trader.exchange_manager.exchange_personal_data.portfolio_manager.portfolio_value_holder,
@@ -1455,9 +1857,10 @@ async def test_can_simply_buy_coins_without_selling(tools):
                     get_target_ratio_mock.reset_mock()
 
 
-async def test_get_simple_buy_coins(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_get_simple_buy_coins(trading_tools):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     mode.indexed_coins = ["BTC", "ETH", "SOL"]
     assert consumer._get_simple_buy_coins({
         index_trading.RebalanceDetails.SELL_SOME.value: {},
@@ -1539,61 +1942,91 @@ async def test_get_simple_buy_coins(tools):
     }) == []
 
 
-async def test_sell_indexed_coins_for_reference_market(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_sell_indexed_coins_for_reference_market(trading_tools):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
-    orders = [
-        mock.Mock(
-            symbol="BTC/USDT",
-            side=trading_enums.TradeOrderSide.SELL
-        ),
-        mock.Mock(
-            symbol="ETH/USDT",
-            side=trading_enums.TradeOrderSide.SELL
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
+    is_futures = trader.exchange_manager.is_future
+    dependencies = trading_signals.get_orders_dependencies([mock.Mock(order_id="123")])
+    if is_futures:
+        mode.indexed_coins = ["BTC/USDT"]
+        positions_manager = trader.exchange_manager.exchange_personal_data.positions_manager
+        symbol_market = trader.exchange_manager.exchange.get_market_status("BTC/USDT", with_fixer=False)
+        position_mock = _create_position_mock(
+            "BTC/USDT", trader, True, is_idle=False,
+            size=decimal.Decimal("2"),
+            side=trading_enums.PositionSide.LONG
         )
-    ]
-    with mock.patch.object(
-            octobot_trading.modes, "convert_assets_to_target_asset", mock.AsyncMock(return_value=orders)
-    ) as convert_assets_to_target_asset_mock, mock.patch.object(
-        trading_personal_data, "wait_for_order_fill", mock.AsyncMock()
-    ) as wait_for_order_fill_mock, mock.patch.object(
-        consumer, "_get_coins_to_sell", mock.Mock(return_value=[1, 2, 3])
-    ) as _get_coins_to_sell_mock:
-        details = {
-            index_trading.RebalanceDetails.REMOVE.value: {}
-        }
-        assert await consumer._sell_indexed_coins_for_reference_market(details, trading_signals.get_orders_dependencies([mock.Mock(order_id="123")])) == orders
-        convert_assets_to_target_asset_mock.assert_called_once_with(
-            mode, [1, 2, 3],
-            consumer.exchange_manager.exchange_personal_data.portfolio_manager.reference_market, {},
-            dependencies=trading_signals.get_orders_dependencies([mock.Mock(order_id="123")])
-        )
-        assert wait_for_order_fill_mock.call_count == 2
-        _get_coins_to_sell_mock.assert_called_once_with(details)
-        convert_assets_to_target_asset_mock.reset_mock()
-        wait_for_order_fill_mock.reset_mock()
-        _get_coins_to_sell_mock.reset_mock()
-
-        # with valid remove coins
-        details = {
-            index_trading.RebalanceDetails.REMOVE.value: {"BTC": 0.01},
-            index_trading.RebalanceDetails.BUY_MORE.value: {},
-            index_trading.RebalanceDetails.ADD.value: {},
-            index_trading.RebalanceDetails.SWAP.value: {},
-            index_trading.RebalanceDetails.FORCED_REBALANCE.value: False,
-        }
-        assert await consumer._sell_indexed_coins_for_reference_market(details, trading_signals.get_orders_dependencies([mock.Mock(order_id="123")])) == orders + orders
-        assert convert_assets_to_target_asset_mock.call_count == 2
-        assert wait_for_order_fill_mock.call_count == 4
-        _get_coins_to_sell_mock.assert_called_once_with(details)
-        convert_assets_to_target_asset_mock.reset_mock()
-        wait_for_order_fill_mock.reset_mock()
-        _get_coins_to_sell_mock.reset_mock()
-
         with mock.patch.object(
-                octobot_trading.modes, "convert_assets_to_target_asset", mock.AsyncMock(return_value=[])
-        ) as convert_assets_to_target_asset_mock_2:
-            # with remove coins that can't be sold
+            octobot_trading.modes, "convert_assets_to_target_asset", mock.AsyncMock(return_value=[])
+        ) as convert_assets_to_target_asset_mock, mock.patch.object(
+            positions_manager, "get_symbol_position", mock.Mock(return_value=position_mock)
+        ) as get_symbol_position_mock, mock.patch.object(
+            trading_personal_data, "get_pre_order_data", mock.AsyncMock(return_value=(
+                decimal.Decimal("0"), decimal.Decimal("0"), decimal.Decimal("0"), decimal.Decimal("1000"), symbol_market
+            ))
+        ) as get_pre_order_data_mock, mock.patch.object(
+            mode, "create_order", mock.AsyncMock(side_effect=lambda order, **kwargs: order)
+        ) as create_order_mock, mock.patch.object(
+            trading_api, "get_open_orders", mock.Mock(return_value=[])
+        ) as get_open_orders_mock, mock.patch.object(
+            consumer.trading_mode.rebalancer, "cancel_symbol_open_orders", mock.AsyncMock()
+        ) as cancel_symbol_open_orders_mock, mock.patch.object(
+            trading_personal_data, "wait_for_order_fill", mock.AsyncMock()
+        ) as wait_for_order_fill_mock:
+            details = {
+                index_trading.RebalanceDetails.REMOVE.value: {},
+                index_trading.RebalanceDetails.SWAP.value: {},
+            }
+            orders = await consumer.trading_mode.rebalancer.sell_indexed_coins_for_reference_market(details, dependencies)
+
+        assert len(orders) == 1
+        assert isinstance(orders[0], trading_personal_data.SellMarketOrder)
+        convert_assets_to_target_asset_mock.assert_not_called()
+        get_symbol_position_mock.assert_called_once_with("BTC/USDT", trading_enums.PositionSide.BOTH)
+        get_pre_order_data_mock.assert_called_once()
+        get_open_orders_mock.assert_called_once_with(mode.exchange_manager, symbol="BTC/USDT")
+        cancel_symbol_open_orders_mock.assert_called_once_with(
+            "BTC/USDT", dependencies, allowed_sides={trading_enums.TradeOrderSide.SELL}
+        )
+        create_order_mock.assert_called_once_with(orders[0], dependencies=dependencies)
+        wait_for_order_fill_mock.assert_called_once()
+    else:
+        orders = [
+            mock.Mock(
+                symbol="BTC/USDT",
+                side=trading_enums.TradeOrderSide.SELL
+            ),
+            mock.Mock(
+                symbol="ETH/USDT",
+                side=trading_enums.TradeOrderSide.SELL
+            )
+        ]
+        with mock.patch.object(
+                octobot_trading.modes, "convert_assets_to_target_asset", mock.AsyncMock(return_value=orders)
+        ) as convert_assets_to_target_asset_mock, mock.patch.object(
+            trading_personal_data, "wait_for_order_fill", mock.AsyncMock()
+        ) as wait_for_order_fill_mock, mock.patch.object(
+            consumer.trading_mode.rebalancer, "get_coins_to_sell", mock.Mock(return_value=["BTC", "ETH", "SOL"])
+        ) as _get_coins_to_sell_mock, mock.patch.object(
+            consumer.trading_mode.rebalancer, "cancel_symbol_open_orders", mock.AsyncMock()
+        ) as cancel_symbol_open_orders_mock:
+            details = {
+                index_trading.RebalanceDetails.REMOVE.value: {}
+            }
+            assert await consumer.trading_mode.rebalancer.sell_indexed_coins_for_reference_market(details, dependencies) == orders
+            convert_assets_to_target_asset_mock.assert_called_once_with(
+                mode, ["BTC", "ETH", "SOL"],
+                consumer.exchange_manager.exchange_personal_data.portfolio_manager.reference_market, {},
+                dependencies=dependencies
+            )
+            assert wait_for_order_fill_mock.call_count == 2
+            _get_coins_to_sell_mock.assert_called_once_with(details)
+            convert_assets_to_target_asset_mock.reset_mock()
+            wait_for_order_fill_mock.reset_mock()
+            _get_coins_to_sell_mock.reset_mock()
+
+            # with valid remove coins
             details = {
                 index_trading.RebalanceDetails.REMOVE.value: {"BTC": 0.01},
                 index_trading.RebalanceDetails.BUY_MORE.value: {},
@@ -1601,22 +2034,407 @@ async def test_sell_indexed_coins_for_reference_market(tools):
                 index_trading.RebalanceDetails.SWAP.value: {},
                 index_trading.RebalanceDetails.FORCED_REBALANCE.value: False,
             }
-            with pytest.raises(trading_errors.MissingMinimalExchangeTradeVolume):
-                assert await consumer._sell_indexed_coins_for_reference_market(details, trading_signals.get_orders_dependencies([mock.Mock(order_id="123")])) == orders + orders
-            convert_assets_to_target_asset_mock_2.assert_called_once_with(
+            assert await consumer.trading_mode.rebalancer.sell_indexed_coins_for_reference_market(details, dependencies) == orders + orders
+            assert convert_assets_to_target_asset_mock.call_count == 2
+            assert wait_for_order_fill_mock.call_count == 4
+            _get_coins_to_sell_mock.assert_called_once_with(details)
+            convert_assets_to_target_asset_mock.reset_mock()
+            wait_for_order_fill_mock.reset_mock()
+            _get_coins_to_sell_mock.reset_mock()
+
+            with mock.patch.object(
+                    octobot_trading.modes, "convert_assets_to_target_asset", mock.AsyncMock(return_value=[])
+            ) as convert_assets_to_target_asset_mock_2:
+                # with remove coins that can't be sold
+                details = {
+                    index_trading.RebalanceDetails.REMOVE.value: {"BTC": 0.01},
+                    index_trading.RebalanceDetails.BUY_MORE.value: {},
+                    index_trading.RebalanceDetails.ADD.value: {},
+                    index_trading.RebalanceDetails.SWAP.value: {},
+                    index_trading.RebalanceDetails.FORCED_REBALANCE.value: False,
+                }
+                with pytest.raises(trading_errors.MissingMinimalExchangeTradeVolume):
+                    assert await consumer.trading_mode.rebalancer.sell_indexed_coins_for_reference_market(details, dependencies) == orders + orders
+                convert_assets_to_target_asset_mock_2.assert_called_once_with(
+                    mode, ["BTC"],
+                    consumer.exchange_manager.exchange_personal_data.portfolio_manager.reference_market, {},
+                    dependencies=dependencies
+                )
+                wait_for_order_fill_mock.assert_not_called()
+                _get_coins_to_sell_mock.assert_not_called()
+
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_sell_some_reduces_or_closes_position(trading_tools):
+    update = {}
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
+    dependencies = trading_signals.get_orders_dependencies([mock.Mock(order_id="123")])
+    if trader.exchange_manager.is_future:
+        mode.indexed_coins = ["BTC/USDT"]
+        positions_manager = trader.exchange_manager.exchange_personal_data.positions_manager
+        symbol_market = trader.exchange_manager.exchange.get_market_status("BTC/USDT", with_fixer=False)
+        portfolio_value_holder = trader.exchange_manager.exchange_personal_data.portfolio_manager.portfolio_value_holder
+        position_mock = _create_position_mock(
+            "BTC/USDT", trader, True, is_idle=False,
+            size=decimal.Decimal("2"),
+            side=trading_enums.PositionSide.LONG
+        )
+
+        with mock.patch.object(
+            positions_manager, "get_symbol_position", mock.Mock(return_value=position_mock)
+        ), mock.patch.object(
+            trading_personal_data, "get_pre_order_data", mock.AsyncMock(return_value=(
+                decimal.Decimal("0"), decimal.Decimal("0"), decimal.Decimal("0"), decimal.Decimal("1000"), symbol_market
+            ))
+        ), mock.patch.object(
+            portfolio_value_holder, "get_traded_assets_holdings_value", mock.Mock(return_value=decimal.Decimal("1000"))
+        ), mock.patch.object(
+            mode, "create_order", mock.AsyncMock(side_effect=lambda order, **kwargs: order)
+        ) as create_order_mock, mock.patch.object(
+            trading_api, "get_open_orders", mock.Mock(return_value=[])
+        ), mock.patch.object(
+            trading_personal_data, "wait_for_order_fill", mock.AsyncMock()
+        ):
+            # target_size = 0.1*1000/1000 = 0.1 => close 1.9 out of 2
+            details = {
+                index_trading.RebalanceDetails.SELL_SOME.value: {"BTC/USDT": decimal.Decimal("0.1")},
+                index_trading.RebalanceDetails.REMOVE.value: {},
+                index_trading.RebalanceDetails.SWAP.value: {},
+            }
+            orders = await consumer.trading_mode.rebalancer.sell_indexed_coins_for_reference_market(details, dependencies)
+            assert len(orders) == 1
+            assert isinstance(orders[0], trading_personal_data.SellMarketOrder)
+            assert orders[0].origin_quantity == decimal.Decimal("1.9")
+
+            create_order_mock.reset_mock()
+            # target_size = 0 => close full position
+            details = {
+                index_trading.RebalanceDetails.SELL_SOME.value: {"BTC/USDT": decimal.Decimal("0")},
+                index_trading.RebalanceDetails.REMOVE.value: {},
+                index_trading.RebalanceDetails.SWAP.value: {},
+            }
+            orders = await consumer.trading_mode.rebalancer.sell_indexed_coins_for_reference_market(details, dependencies)
+            assert len(orders) == 1
+            assert isinstance(orders[0], trading_personal_data.SellMarketOrder)
+            assert orders[0].origin_quantity == decimal.Decimal("2")
+    else:
+        mode.indexed_coins = ["BTC"]
+        converted_orders = [mock.Mock(symbol="BTC/USDT", side=trading_enums.TradeOrderSide.SELL)]
+        with mock.patch.object(
+            octobot_trading.modes, "convert_assets_to_target_asset", mock.AsyncMock(return_value=converted_orders)
+        ) as convert_assets_to_target_asset_mock, mock.patch.object(
+            trading_personal_data, "wait_for_order_fill", mock.AsyncMock()
+        ):
+            details = {
+                index_trading.RebalanceDetails.SELL_SOME.value: {"BTC": decimal.Decimal("0.1")},
+                index_trading.RebalanceDetails.REMOVE.value: {},
+                index_trading.RebalanceDetails.SWAP.value: {},
+            }
+            orders = await consumer.trading_mode.rebalancer.sell_indexed_coins_for_reference_market(details, dependencies)
+            assert orders == converted_orders
+            convert_assets_to_target_asset_mock.assert_called_once_with(
                 mode, ["BTC"],
                 consumer.exchange_manager.exchange_personal_data.portfolio_manager.reference_market, {},
-                dependencies=trading_signals.get_orders_dependencies([mock.Mock(order_id="123")])
+                dependencies=dependencies
             )
-            wait_for_order_fill_mock.assert_not_called()
-            _get_coins_to_sell_mock.assert_not_called()
+
+        # When pending sells already exceed holdings, no new sell is created
+        portfolio = trader.exchange_manager.exchange_personal_data.portfolio_manager.portfolio.portfolio
+        portfolio["BTC"].total = decimal.Decimal("1")
+        stale_sell_order = mock.Mock(
+            symbol="BTC/USDT",
+            side=trading_enums.TradeOrderSide.SELL,
+            origin_quantity=decimal.Decimal("2"),
+            filled_quantity=decimal.Decimal("0"),
+        )
+        stale_buy_order = mock.Mock(
+            symbol="BTC/USDT",
+            side=trading_enums.TradeOrderSide.BUY,
+            origin_quantity=decimal.Decimal("1"),
+            filled_quantity=decimal.Decimal("0"),
+        )
+        with mock.patch.object(
+            octobot_trading.modes, "convert_assets_to_target_asset", mock.AsyncMock(return_value=[])
+        ), mock.patch.object(
+            trading_api, "get_open_orders", mock.Mock(return_value=[stale_sell_order, stale_buy_order])
+        ), mock.patch.object(
+            mode, "cancel_order", mock.AsyncMock(return_value=(True, commons_signals.SignalDependencies()))
+        ) as cancel_order_mock, mock.patch.object(
+            trading_personal_data, "wait_for_order_fill", mock.AsyncMock()
+        ):
+            details = {
+                index_trading.RebalanceDetails.SELL_SOME.value: {"BTC": decimal.Decimal("0.1")},
+                index_trading.RebalanceDetails.REMOVE.value: {},
+                index_trading.RebalanceDetails.SWAP.value: {},
+            }
+            orders = await consumer.trading_mode.rebalancer.sell_indexed_coins_for_reference_market(details, dependencies)
+            assert orders == []
 
 
-async def test_get_coins_to_sell(tools):
+async def test_close_position_refreshes_stale_internal_state(futures_tools):
+    """
+    When a filled BUY order's portfolio-update event times out, the
+    internal positions_manager still shows an idle (empty) position. On the next
+    rebalance _close_symbol_position must refresh the position from the exchange before
+    deciding there is nothing to sell, otherwise the real holding is silently abandoned.
+    """
+    mode, producer, consumer, trader = await _init_mode(futures_tools, _get_config(futures_tools, {}))
+    mode.indexed_coins = ["BTC/USDT"]
+    positions_manager = trader.exchange_manager.exchange_personal_data.positions_manager
+    symbol_market = trader.exchange_manager.exchange.get_market_status("BTC/USDT", with_fixer=False)
+    dependencies = trading_signals.get_orders_dependencies([mock.Mock(order_id="123")])
+
+    stale_position = _create_position_mock("BTC/USDT", trader, True, is_idle=True)
+    fresh_position = _create_position_mock(
+        "BTC/USDT", trader, True, is_idle=False,
+        size=decimal.Decimal("2"),
+        side=trading_enums.PositionSide.LONG,
+    )
+
+    refresh_calls = []
+
+    async def _mock_refresh(position, force_job_execution=False):
+        refresh_calls.append(position)
+
+    with mock.patch.object(
+        positions_manager, "get_symbol_position",
+        side_effect=[stale_position, fresh_position]
+    ), mock.patch.object(
+        positions_manager, "refresh_real_trader_position",
+        side_effect=_mock_refresh
+    ) as refresh_mock, mock.patch.object(
+        trading_personal_data, "get_pre_order_data", mock.AsyncMock(return_value=(
+            decimal.Decimal("0"), decimal.Decimal("0"), decimal.Decimal("0"),
+            decimal.Decimal("1000"), symbol_market
+        ))
+    ), mock.patch.object(
+        trading_api, "get_open_orders", mock.Mock(return_value=[])
+    ), mock.patch.object(
+        consumer.trading_mode.rebalancer, "cancel_symbol_open_orders", mock.AsyncMock()
+    ) as cancel_mock, mock.patch.object(
+        mode, "create_order", mock.AsyncMock(side_effect=lambda order, **kwargs: order)
+    ) as create_order_mock:
+        details = {
+            index_trading.RebalanceDetails.REMOVE.value: {"BTC/USDT": None},
+            index_trading.RebalanceDetails.SWAP.value: {},
+        }
+        orders = await consumer.trading_mode.rebalancer.get_coins_to_sell_orders(details, dependencies)
+
+    assert refresh_calls, "refresh_real_trader_position was not called when internal position was idle"
+    assert orders, "no sell order was placed after the position refresh revealed the real holding"
+    cancel_mock.assert_called_once_with(
+        "BTC/USDT", dependencies, allowed_sides={trading_enums.TradeOrderSide.SELL}
+    )
+
+
+async def test_close_position_cancels_stuck_sell_orders(futures_tools):
+    """
+    The rebalancer must cancel the stuck order before placing a fresh one at the current market price.
+    """
+    mode, producer, consumer, trader = await _init_mode(futures_tools, _get_config(futures_tools, {}))
+    mode.indexed_coins = ["BTC/USDT"]
+    positions_manager = trader.exchange_manager.exchange_personal_data.positions_manager
+    symbol_market = trader.exchange_manager.exchange.get_market_status("BTC/USDT", with_fixer=False)
+    dependencies = trading_signals.get_orders_dependencies([mock.Mock(order_id="123")])
+
+    position_mock = _create_position_mock(
+        "BTC/USDT", trader, True, is_idle=False,
+        size=decimal.Decimal("2"),
+        side=trading_enums.PositionSide.LONG,
+    )
+
+    cancel_calls = []
+
+    async def _mock_cancel(sym, deps, allowed_sides=None):
+        cancel_calls.append((sym, allowed_sides))
+
+    with mock.patch.object(
+        positions_manager, "get_symbol_position", mock.Mock(return_value=position_mock)
+    ), mock.patch.object(
+        trading_personal_data, "get_pre_order_data", mock.AsyncMock(return_value=(
+            decimal.Decimal("0"), decimal.Decimal("0"), decimal.Decimal("0"),
+            decimal.Decimal("1000"), symbol_market
+        ))
+    ), mock.patch.object(
+        # cancel_symbol_open_orders is mocked, so get_open_orders only sees post-cancel state (no stuck orders)
+        trading_api, "get_open_orders", mock.Mock(return_value=[])
+    ), mock.patch.object(
+        consumer.trading_mode.rebalancer, "cancel_symbol_open_orders",
+        mock.AsyncMock(side_effect=_mock_cancel)
+    ), mock.patch.object(
+        mode, "create_order", mock.AsyncMock(side_effect=lambda order, **kwargs: order)
+    ) as create_order_mock:
+        details = {
+            index_trading.RebalanceDetails.REMOVE.value: {"BTC/USDT": None},
+            index_trading.RebalanceDetails.SWAP.value: {},
+        }
+        orders = await consumer.trading_mode.rebalancer.get_coins_to_sell_orders(details, dependencies)
+
+    assert cancel_calls, "cancel_symbol_open_orders was not called — stuck GTC sell order would stay open"
+    assert cancel_calls[0] == ("BTC/USDT", {trading_enums.TradeOrderSide.SELL})
+    assert orders, "no fresh sell order was placed after cancelling the stuck one"
+
+
+def _cleanup_rebalance_details(
+    *,
+    remove: typing.Optional[dict] = None,
+    sell_some: typing.Optional[dict] = None,
+    buy_more: typing.Optional[dict] = None,
+    add: typing.Optional[dict] = None,
+    swap: typing.Optional[dict] = None,
+    forced_rebalance: bool = False,
+) -> dict:
+    return {
+        index_trading.RebalanceDetails.SELL_SOME.value: sell_some or {},
+        index_trading.RebalanceDetails.BUY_MORE.value: buy_more or {},
+        index_trading.RebalanceDetails.REMOVE.value: remove or {},
+        index_trading.RebalanceDetails.ADD.value: add or {},
+        index_trading.RebalanceDetails.SWAP.value: swap or {},
+        index_trading.RebalanceDetails.FORCED_REBALANCE.value: forced_rebalance,
+    }
+
+
+def _mock_open_orders(
+    sides: list[trading_enums.TradeOrderSide],
+    symbol: str = "BTC/USDT",
+) -> list[mock.Mock]:
+    return [
+        mock.Mock(
+            symbol=symbol,
+            side=side,
+            origin_quantity=decimal.Decimal("1"),
+            filled_quantity=decimal.Decimal("0"),
+        )
+        for side in sides
+    ]
+
+
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+@pytest.mark.parametrize(
+    "details,expected_symbols",
+    [
+        pytest.param(
+            _cleanup_rebalance_details(
+                buy_more={"ETH/USDT": decimal.Decimal("0.2")},
+                add={"BTC": decimal.Decimal("0.2")},
+            ),
+            {"BTC/USDT", "ETH/USDT"},
+            id="add_and_buy_more_cleanup",
+        ),
+        pytest.param(
+            _cleanup_rebalance_details(
+                buy_more={"BTC/USDT": decimal.Decimal("0.2")},
+                add={"BTC": decimal.Decimal("0.2")},
+            ),
+            {"BTC/USDT"},
+            id="dedup_same_symbol_from_add_and_buy_more",
+        ),
+        pytest.param(
+            _cleanup_rebalance_details(),
+            set(),
+            id="no_add_no_buy_more",
+        ),
+    ],
+)
+async def test_buy_cleanup_on_rebalance_actions(trading_tools, details, expected_symbols):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
+    dependencies = trading_signals.get_orders_dependencies([mock.Mock(order_id="123")])
+    mode.allow_skip_asset = True
+    with mock.patch.object(
+        consumer.trading_mode.rebalancer, "cancel_symbol_open_orders", mock.AsyncMock()
+    ) as cancel_symbol_open_orders_mock, mock.patch.object(
+        consumer, "_get_symbols_and_amounts", mock.AsyncMock(return_value={})
+    ) as get_symbols_and_amounts_mock, mock.patch.object(
+        consumer.trading_mode.rebalancer, "buy_coin", mock.AsyncMock()
+    ) as buy_coin_mock:
+        orders = await consumer._split_reference_market_into_indexed_coins(details, True, dependencies)
+
+    assert orders == []
+    cancelled_symbols = {call.args[0] for call in cancel_symbol_open_orders_mock.call_args_list}
+    assert cancelled_symbols == expected_symbols
+    for call in cancel_symbol_open_orders_mock.call_args_list:
+        assert call.kwargs["dependencies"] == dependencies
+        assert call.kwargs["allowed_sides"] == {trading_enums.TradeOrderSide.SELL}
+    get_symbols_and_amounts_mock.assert_called_once()
+    buy_coin_mock.assert_not_called()
+
+
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+@pytest.mark.parametrize(
+    "details,open_order_sides,expected_cancelled_sides,portfolio_total,exact_cancelled_sides",
+    [
+        pytest.param(
+            _cleanup_rebalance_details(remove={"BTC": decimal.Decimal("0.1")}),
+            [trading_enums.TradeOrderSide.BUY, trading_enums.TradeOrderSide.SELL],
+            {trading_enums.TradeOrderSide.BUY},
+            decimal.Decimal("0"),
+            True,
+            id="remove_without_holdings_buy_and_sell_orders",
+        ),
+        pytest.param(
+            _cleanup_rebalance_details(remove={"BTC": decimal.Decimal("0.1")}),
+            [trading_enums.TradeOrderSide.BUY],
+            {trading_enums.TradeOrderSide.BUY},
+            decimal.Decimal("0"),
+            True,
+            id="remove_without_holdings_only_buy_order",
+        ),
+        pytest.param(
+            _cleanup_rebalance_details(remove={"BTC": decimal.Decimal("0.1")}),
+            [trading_enums.TradeOrderSide.BUY, trading_enums.TradeOrderSide.SELL],
+            {trading_enums.TradeOrderSide.BUY},
+            decimal.Decimal("1"),
+            True,
+            id="remove_with_holdings_no_post_cleanup",
+        ),
+        pytest.param(
+            _cleanup_rebalance_details(
+                remove={"BTC": decimal.Decimal("0.1")},
+                sell_some={"BTC/USDT": decimal.Decimal("0.2")},
+            ),
+            [trading_enums.TradeOrderSide.BUY],
+            {trading_enums.TradeOrderSide.BUY},
+            decimal.Decimal("1"),
+            True,
+            id="dedup_same_symbol_from_remove_and_sell_some",
+        ),
+    ],
+)
+async def test_sell_cleanup_on_rebalance_actions(
+    trading_tools, details, open_order_sides, expected_cancelled_sides, portfolio_total, exact_cancelled_sides
+):
+    update = {}
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
+    dependencies = trading_signals.get_orders_dependencies([mock.Mock(order_id="123")])
+    portfolio = trader.exchange_manager.exchange_personal_data.portfolio_manager.portfolio.portfolio
+    portfolio["BTC"].total = portfolio_total
+    portfolio["BTC"].available = portfolio_total
+    open_orders = _mock_open_orders(open_order_sides)
+    with mock.patch.object(
+        octobot_trading.modes, "convert_assets_to_target_asset", mock.AsyncMock(return_value=[])
+    ), mock.patch.object(
+        trading_api, "get_open_orders", mock.Mock(return_value=open_orders)
+    ), mock.patch.object(
+        mode, "cancel_order", mock.AsyncMock(return_value=(True, commons_signals.SignalDependencies()))
+    ) as cancel_order_mock, mock.patch.object(
+        trading_personal_data, "wait_for_order_fill", mock.AsyncMock()
+    ):
+        with pytest.raises(trading_errors.MissingMinimalExchangeTradeVolume):
+            await consumer.trading_mode.rebalancer.sell_indexed_coins_for_reference_market(details, dependencies)
+
+    cancelled_sides = {call.args[0].side for call in cancel_order_mock.call_args_list}
+    if exact_cancelled_sides:
+        assert cancelled_sides == expected_cancelled_sides
+    else:
+        assert expected_cancelled_sides.issubset(cancelled_sides)
+
+
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_get_coins_to_sell(trading_tools):
+    update = {}
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     mode.indexed_coins = ["BTC", "ETH", "DOGE", "SHIB"]
-    assert consumer._get_coins_to_sell({
+    assert consumer.trading_mode.rebalancer.get_coins_to_sell({
         index_trading.RebalanceDetails.SELL_SOME.value: {},
         index_trading.RebalanceDetails.BUY_MORE.value: {},
         index_trading.RebalanceDetails.REMOVE.value: {},
@@ -1624,7 +2442,7 @@ async def test_get_coins_to_sell(tools):
         index_trading.RebalanceDetails.SWAP.value: {},
         index_trading.RebalanceDetails.FORCED_REBALANCE.value: False,
     }) == ["BTC", "ETH", "DOGE", "SHIB"]
-    assert consumer._get_coins_to_sell({
+    assert consumer.trading_mode.rebalancer.get_coins_to_sell({
         index_trading.RebalanceDetails.SELL_SOME.value: {},
         index_trading.RebalanceDetails.BUY_MORE.value: {},
         index_trading.RebalanceDetails.REMOVE.value: {},
@@ -1633,7 +2451,7 @@ async def test_get_coins_to_sell(tools):
             "BTC": "ETH"
         },
     }) == ["BTC"]
-    assert consumer._get_coins_to_sell({
+    assert consumer.trading_mode.rebalancer.get_coins_to_sell({
         index_trading.RebalanceDetails.SELL_SOME.value: {},
         index_trading.RebalanceDetails.BUY_MORE.value: {},
         index_trading.RebalanceDetails.REMOVE.value: {
@@ -1646,7 +2464,7 @@ async def test_get_coins_to_sell(tools):
         },
         index_trading.RebalanceDetails.FORCED_REBALANCE.value: False,
     }) == ["BTC", "SOL"]
-    assert consumer._get_coins_to_sell({
+    assert consumer.trading_mode.rebalancer.get_coins_to_sell({
         index_trading.RebalanceDetails.SELL_SOME.value: {},
         index_trading.RebalanceDetails.BUY_MORE.value: {},
         index_trading.RebalanceDetails.REMOVE.value: {},
@@ -1654,7 +2472,7 @@ async def test_get_coins_to_sell(tools):
         index_trading.RebalanceDetails.SWAP.value: {},
         index_trading.RebalanceDetails.FORCED_REBALANCE.value: False,
     }) == ["BTC", "ETH", "DOGE", "SHIB"]
-    assert consumer._get_coins_to_sell({
+    assert consumer.trading_mode.rebalancer.get_coins_to_sell({
         index_trading.RebalanceDetails.SELL_SOME.value: {},
         index_trading.RebalanceDetails.BUY_MORE.value: {},
         index_trading.RebalanceDetails.REMOVE.value: {
@@ -1666,79 +2484,104 @@ async def test_get_coins_to_sell(tools):
     }) == ["BTC", "ETH", "DOGE", "SHIB"]
 
 
-async def test_resolve_swaps(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_resolve_swaps(trading_tools):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     mode.rebalance_trigger_min_ratio = decimal.Decimal("0.05")  # %5
-    rebalance_details = {
-        index_trading.RebalanceDetails.SELL_SOME.value: {},
-        index_trading.RebalanceDetails.BUY_MORE.value: {},
-        index_trading.RebalanceDetails.REMOVE.value: {},
-        index_trading.RebalanceDetails.ADD.value: {},
-        index_trading.RebalanceDetails.SWAP.value: {},
-    }
-    # regular full rebalance
-    producer._resolve_swaps(rebalance_details)
-    assert rebalance_details[index_trading.RebalanceDetails.SWAP.value] == {}
+    is_futures = trader.exchange_manager.is_future
+    positions_manager = trader.exchange_manager.exchange_personal_data.positions_manager
+    
+    def _get_symbol_position(symbol, side=None):
+        return _create_position_mock(
+            symbol, trader, is_futures,
+            is_idle=False,
+            size=decimal.Decimal(2),
+            side=trading_enums.PositionSide.LONG,
+            initial_margin=decimal.Decimal(0),
+            margin=decimal.Decimal(0),
+        )
+    
+    with mock.patch.object(
+        positions_manager, "get_symbol_position", mock.Mock(side_effect=_get_symbol_position)
+    ), \
+    mock.patch.object(
+        order_util, "get_futures_max_order_size", mock.Mock(return_value=(decimal.Decimal(10), True))
+    ), \
+    mock.patch.object(
+        trader.exchange_manager.exchange, "get_pair_contract",
+        return_value=mock.Mock() if is_futures else None
+    ):
+        rebalance_details = {
+            index_trading.RebalanceDetails.SELL_SOME.value: {},
+            index_trading.RebalanceDetails.BUY_MORE.value: {},
+            index_trading.RebalanceDetails.REMOVE.value: {},
+            index_trading.RebalanceDetails.ADD.value: {},
+            index_trading.RebalanceDetails.SWAP.value: {},
+        }
+        # regular full rebalance
+        producer._resolve_swaps(rebalance_details)
+        assert rebalance_details[index_trading.RebalanceDetails.SWAP.value] == {}
 
-    # regular full rebalance with removed coins to sell
-    rebalance_details[index_trading.RebalanceDetails.REMOVE.value] = {"SOL": decimal.Decimal("0.3")}
-    producer._resolve_swaps(rebalance_details)
-    assert rebalance_details[index_trading.RebalanceDetails.SWAP.value] == {}
+        # regular full rebalance with removed coins to sell
+        rebalance_details[index_trading.RebalanceDetails.REMOVE.value] = {"SOL": decimal.Decimal("0.3")}
+        producer._resolve_swaps(rebalance_details)
+        assert rebalance_details[index_trading.RebalanceDetails.SWAP.value] == {}
 
-    # rebalances with a coin swap only from ADD coin
-    rebalance_details[index_trading.RebalanceDetails.ADD.value] = {"ADA": decimal.Decimal("0.3")}
-    producer._resolve_swaps(rebalance_details)
-    assert rebalance_details[index_trading.RebalanceDetails.SWAP.value] == {"SOL": "ADA"}
+        # rebalances with a coin swap only from ADD coin
+        rebalance_details[index_trading.RebalanceDetails.ADD.value] = {"ADA": decimal.Decimal("0.3")}
+        producer._resolve_swaps(rebalance_details)
+        assert rebalance_details[index_trading.RebalanceDetails.SWAP.value] == {"SOL": "ADA"}
 
-    # rebalances with a coin swap only from BUY_MORE coin
-    rebalance_details[index_trading.RebalanceDetails.ADD.value] = {}
-    rebalance_details[index_trading.RebalanceDetails.BUY_MORE.value] = {"ADA": decimal.Decimal("0.3")}
-    producer._resolve_swaps(rebalance_details)
-    assert rebalance_details[index_trading.RebalanceDetails.SWAP.value] == {"SOL": "ADA"}
-    rebalance_details[index_trading.RebalanceDetails.BUY_MORE.value] = {}
+        # rebalances with a coin swap only from BUY_MORE coin
+        rebalance_details[index_trading.RebalanceDetails.ADD.value] = {}
+        rebalance_details[index_trading.RebalanceDetails.BUY_MORE.value] = {"ADA": decimal.Decimal("0.3")}
+        producer._resolve_swaps(rebalance_details)
+        assert rebalance_details[index_trading.RebalanceDetails.SWAP.value] == {"SOL": "ADA"}
+        rebalance_details[index_trading.RebalanceDetails.BUY_MORE.value] = {}
 
-    # rebalances with an incompatible coin swap (ratio too different)
-    rebalance_details[index_trading.RebalanceDetails.BUY_MORE.value] = {"ADA": decimal.Decimal("0.1")}
-    producer._resolve_swaps(rebalance_details)
-    assert rebalance_details[index_trading.RebalanceDetails.SWAP.value] == {}
-    rebalance_details[index_trading.RebalanceDetails.BUY_MORE.value] = {}
+        # rebalances with an incompatible coin swap (ratio too different)
+        rebalance_details[index_trading.RebalanceDetails.BUY_MORE.value] = {"ADA": decimal.Decimal("0.1")}
+        producer._resolve_swaps(rebalance_details)
+        assert rebalance_details[index_trading.RebalanceDetails.SWAP.value] == {}
+        rebalance_details[index_trading.RebalanceDetails.BUY_MORE.value] = {}
 
-    # rebalances with an incompatible coin swap (ratio too different)
-    rebalance_details[index_trading.RebalanceDetails.ADD.value] = {"ADA": decimal.Decimal("0.5")}
-    producer._resolve_swaps(rebalance_details)
-    assert rebalance_details[index_trading.RebalanceDetails.SWAP.value] == {}
+        # rebalances with an incompatible coin swap (ratio too different)
+        rebalance_details[index_trading.RebalanceDetails.ADD.value] = {"ADA": decimal.Decimal("0.5")}
+        producer._resolve_swaps(rebalance_details)
+        assert rebalance_details[index_trading.RebalanceDetails.SWAP.value] == {}
 
-    # rebalances with 2 removed coins: sell everything
-    rebalance_details[index_trading.RebalanceDetails.REMOVE.value] = {
-        "SOL": decimal.Decimal("0.3"),
-        "XRP": decimal.Decimal("0.3"),
-    }
-    producer._resolve_swaps(rebalance_details)
-    assert rebalance_details[index_trading.RebalanceDetails.SWAP.value] == {}
+        # rebalances with 2 removed coins: sell everything
+        rebalance_details[index_trading.RebalanceDetails.REMOVE.value] = {
+            "SOL": decimal.Decimal("0.3"),
+            "XRP": decimal.Decimal("0.3"),
+        }
+        producer._resolve_swaps(rebalance_details)
+        assert rebalance_details[index_trading.RebalanceDetails.SWAP.value] == {}
 
-    # rebalances with 2 coin swaps: sell everything
-    rebalance_details[index_trading.RebalanceDetails.ADD.value] = {
-        "ADA": decimal.Decimal("0.3"),
-        "ADA2": decimal.Decimal("0.3"),
-    }
-    producer._resolve_swaps(rebalance_details)
-    assert rebalance_details[index_trading.RebalanceDetails.SWAP.value] == {}
+        # rebalances with 2 coin swaps: sell everything
+        rebalance_details[index_trading.RebalanceDetails.ADD.value] = {
+            "ADA": decimal.Decimal("0.3"),
+            "ADA2": decimal.Decimal("0.3"),
+        }
+        producer._resolve_swaps(rebalance_details)
+        assert rebalance_details[index_trading.RebalanceDetails.SWAP.value] == {}
 
-    # rebalance with regular buy / sell more
-    rebalance_details[index_trading.RebalanceDetails.BUY_MORE.value] = {"LTC": decimal.Decimal(1)}
-    producer._resolve_swaps(rebalance_details)
-    assert rebalance_details[index_trading.RebalanceDetails.SWAP.value] == {}
+        # rebalance with regular buy / sell more
+        rebalance_details[index_trading.RebalanceDetails.BUY_MORE.value] = {"LTC": decimal.Decimal(1)}
+        producer._resolve_swaps(rebalance_details)
+        assert rebalance_details[index_trading.RebalanceDetails.SWAP.value] == {}
 
-    # rebalance with regular buy / sell more
-    rebalance_details[index_trading.RebalanceDetails.SELL_SOME.value] = {"BTC": decimal.Decimal(1)}
-    producer._resolve_swaps(rebalance_details)
-    assert rebalance_details[index_trading.RebalanceDetails.SWAP.value] == {}
+        # rebalance with regular buy / sell more
+        rebalance_details[index_trading.RebalanceDetails.SELL_SOME.value] = {"BTC": decimal.Decimal(1)}
+        producer._resolve_swaps(rebalance_details)
+        assert rebalance_details[index_trading.RebalanceDetails.SWAP.value] == {}
 
 
-async def test_split_reference_market_into_indexed_coins(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_split_reference_market_into_indexed_coins(trading_tools):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     # no indexed coin
     mode.indexed_coins = []
     details = {index_trading.RebalanceDetails.SWAP.value: {}}
@@ -1746,7 +2589,13 @@ async def test_split_reference_market_into_indexed_coins(tools):
     dependencies = trading_signals.get_orders_dependencies([mock.Mock(order_id="123")])
     with mock.patch.object(
         consumer, "_get_symbols_and_amounts", mock.AsyncMock(
-            side_effect=lambda coins, _: {f"{coin}/USDT": decimal.Decimal(i + 1) for i, coin in enumerate(coins)}
+            side_effect=lambda coins, coins_prices, reference_market_to_split: {
+                f"{coin}/USDT": {
+                    consumer.IDEAL_AMOUNT: decimal.Decimal(i + 1),
+                    consumer.IDEAL_PRICE: None
+                }
+                for i, coin in enumerate(coins)
+            }
         )
     ) as _get_symbols_and_amounts_mock:
         with mock.patch.object(
@@ -1756,7 +2605,7 @@ async def test_split_reference_market_into_indexed_coins(tools):
                     trader.exchange_manager.exchange_personal_data.portfolio_manager.portfolio,
                     "get_currency_portfolio", mock.Mock(return_value=mock.Mock(available=decimal.Decimal("2")))
             ) as get_currency_portfolio_mock, mock.patch.object(
-                consumer, "_buy_coin", mock.AsyncMock(return_value=["order"])
+                consumer.trading_mode.rebalancer, "buy_coin", mock.AsyncMock(return_value=["order"])
             ) as _buy_coin_mock:
                 with pytest.raises(trading_errors.MissingMinimalExchangeTradeVolume):
                     await consumer._split_reference_market_into_indexed_coins(details, is_simple_buy_without_selling, dependencies)
@@ -1776,19 +2625,49 @@ async def test_split_reference_market_into_indexed_coins(tools):
                 trader.exchange_manager.exchange_personal_data.portfolio_manager.portfolio_value_holder,
                 "get_traded_assets_holdings_value", mock.Mock(return_value=decimal.Decimal("2000"))
             ) as get_traded_assets_holdings_value_mock, mock.patch.object(
-                consumer, "_buy_coin", mock.AsyncMock(return_value=["order"])
+                consumer.trading_mode.rebalancer, "buy_coin", mock.AsyncMock(return_value=["order"])
             ) as _buy_coin_mock:
+                # Test with default reference_market_ratio = 0 (no reservation)
+                mode.reference_market_ratio = trading_constants.ZERO
+                reference_market_to_split = decimal.Decimal("2000")
+                reference_market_reserved = reference_market_to_split * mode.reference_market_ratio
+                reference_market_to_distribute = reference_market_to_split - reference_market_reserved
+                
                 assert await consumer._split_reference_market_into_indexed_coins(
                     details, is_simple_buy_without_selling, dependencies
                 ) == ["order", "order"]
                 _get_symbols_and_amounts_mock.assert_called_once()
+                # Verify _get_symbols_and_amounts was called with correct reference_market_to_distribute
+                assert _get_symbols_and_amounts_mock.call_args[0][2] == reference_market_to_distribute
+                assert reference_market_reserved == trading_constants.ZERO
+                assert reference_market_to_distribute == reference_market_to_split
                 _get_symbols_and_amounts_mock.reset_mock()
                 get_traded_assets_holdings_value_mock.assert_called_once_with("USDT", None)
                 get_currency_portfolio_mock.assert_not_called()
                 _get_simple_buy_coins_mock.assert_not_called()
                 assert _buy_coin_mock.call_count == 2
-                assert _buy_coin_mock.mock_calls[0].args == ("ETH/USDT", decimal.Decimal("1"), dependencies)
-                assert _buy_coin_mock.mock_calls[1].args == ("SOL/USDT", decimal.Decimal("2"), dependencies)
+                assert _buy_coin_mock.mock_calls[0].args == ("ETH/USDT", decimal.Decimal("1"), None, dependencies)
+                assert _buy_coin_mock.mock_calls[1].args == ("SOL/USDT", decimal.Decimal("2"), None, dependencies)
+                
+                # Test with reference_market_ratio > 0 (with reservation)
+                get_traded_assets_holdings_value_mock.reset_mock()
+                _buy_coin_mock.reset_mock()
+                mode.reference_market_ratio = decimal.Decimal("0.1")  # 10% to trade
+                reference_market_to_split = decimal.Decimal("2000")
+                reference_market_to_distribute = reference_market_to_split * mode.reference_market_ratio
+                reference_market_reserved = reference_market_to_split - reference_market_to_distribute
+                
+                assert await consumer._split_reference_market_into_indexed_coins(
+                    details, is_simple_buy_without_selling, dependencies
+                ) == ["order", "order"]
+                _get_symbols_and_amounts_mock.assert_called_once()
+                # Verify _get_symbols_and_amounts was called with correct reference_market_to_distribute
+                assert _get_symbols_and_amounts_mock.call_args[0][2] == reference_market_to_distribute
+                assert reference_market_to_distribute == decimal.Decimal("200")
+                assert reference_market_reserved == decimal.Decimal("1800")
+                _get_symbols_and_amounts_mock.reset_mock()
+                get_traded_assets_holdings_value_mock.assert_called_once_with("USDT", None)
+                _buy_coin_mock.reset_mock()
 
             # no bought coin
             details = {index_trading.RebalanceDetails.SWAP.value: {}}
@@ -1797,7 +2676,7 @@ async def test_split_reference_market_into_indexed_coins(tools):
                     trader.exchange_manager.exchange_personal_data.portfolio_manager.portfolio,
                     "get_currency_portfolio", mock.Mock(return_value=mock.Mock(available=decimal.Decimal("2")))
             ) as get_currency_portfolio_mock, mock.patch.object(
-                consumer, "_buy_coin", mock.AsyncMock(return_value=[])
+                consumer.trading_mode.rebalancer, "buy_coin", mock.AsyncMock(return_value=[])
             ) as _buy_coin_mock:
                 with pytest.raises(trading_errors.MissingMinimalExchangeTradeVolume):
                     await consumer._split_reference_market_into_indexed_coins(details, is_simple_buy_without_selling, dependencies)
@@ -1813,20 +2692,50 @@ async def test_split_reference_market_into_indexed_coins(tools):
                     trader.exchange_manager.exchange_personal_data.portfolio_manager.portfolio,
                     "get_currency_portfolio", mock.Mock(return_value=mock.Mock(available=decimal.Decimal("2")))
             ) as get_currency_portfolio_mock, mock.patch.object(
-                consumer, "_buy_coin", mock.AsyncMock(return_value=["order"])
+                consumer.trading_mode.rebalancer, "buy_coin", mock.AsyncMock(return_value=["order"])
             ) as _buy_coin_mock:
+                # Test with default reference_market_ratio = 0 (no reservation)
+                mode.reference_market_ratio = trading_constants.ZERO
+                reference_market_to_split = decimal.Decimal("2")
+                reference_market_reserved = reference_market_to_split * mode.reference_market_ratio
+                reference_market_to_distribute = reference_market_to_split - reference_market_reserved
+                
                 assert await consumer._split_reference_market_into_indexed_coins(
                     details, is_simple_buy_without_selling, dependencies
                 ) == ["order", "order"]
                 _get_symbols_and_amounts_mock.assert_called_once()
+                # Verify _get_symbols_and_amounts was called with correct reference_market_to_distribute
+                assert _get_symbols_and_amounts_mock.call_args[0][2] == reference_market_to_distribute
+                assert reference_market_reserved == trading_constants.ZERO
+                assert reference_market_to_distribute == reference_market_to_split
                 _get_symbols_and_amounts_mock.reset_mock()
                 get_currency_portfolio_mock.assert_called_once_with("USDT")
                 _get_simple_buy_coins_mock.assert_not_called()
                 assert _buy_coin_mock.call_count == 2
                 assert _buy_coin_mock.mock_calls[0].args[0] == "ETH/USDT"
-                assert _buy_coin_mock.mock_calls[0].args[2] == dependencies
+                assert _buy_coin_mock.mock_calls[0].args[3] == dependencies
                 assert _buy_coin_mock.mock_calls[1].args[0] == "BTC/USDT"
-                assert _buy_coin_mock.mock_calls[1].args[2] == dependencies
+                assert _buy_coin_mock.mock_calls[1].args[3] == dependencies
+                
+                # Test with reference_market_ratio > 0 (with reservation)
+                get_currency_portfolio_mock.reset_mock()
+                _buy_coin_mock.reset_mock()
+                mode.reference_market_ratio = decimal.Decimal("0.15")  # 15% to trade
+                reference_market_to_split = decimal.Decimal("2")
+                reference_market_to_distribute = reference_market_to_split * mode.reference_market_ratio
+                reference_market_reserved = reference_market_to_split - reference_market_to_distribute
+                
+                assert await consumer._split_reference_market_into_indexed_coins(
+                    details, is_simple_buy_without_selling, dependencies
+                ) == ["order", "order"]
+                _get_symbols_and_amounts_mock.assert_called_once()
+                # Verify _get_symbols_and_amounts was called with correct reference_market_to_distribute
+                assert _get_symbols_and_amounts_mock.call_args[0][2] == reference_market_to_distribute
+                assert reference_market_to_distribute == decimal.Decimal("0.3")
+                assert reference_market_reserved == decimal.Decimal("1.7")
+                _get_symbols_and_amounts_mock.reset_mock()
+                get_currency_portfolio_mock.assert_called_once_with("USDT")
+                _buy_coin_mock.reset_mock()
 
         with mock.patch.object(
             consumer, "_get_simple_buy_coins", mock.Mock(return_value=["ETH"])
@@ -1838,39 +2747,80 @@ async def test_split_reference_market_into_indexed_coins(tools):
                     trader.exchange_manager.exchange_personal_data.portfolio_manager.portfolio,
                     "get_currency_portfolio", mock.Mock(return_value=mock.Mock(available=decimal.Decimal("2")))
             ) as get_currency_portfolio_mock, mock.patch.object(
-                consumer, "_buy_coin", mock.AsyncMock(return_value=["order"])
+                consumer.trading_mode.rebalancer, "buy_coin", mock.AsyncMock(return_value=["order"])
             ) as _buy_coin_mock, mock.patch.object(
                 trader.exchange_manager.exchange_personal_data.portfolio_manager.portfolio_value_holder,
                 "get_traded_assets_holdings_value", mock.Mock(return_value=decimal.Decimal("2000"))
             ) as get_traded_assets_holdings_value_mock:
+                # Test with default reference_market_ratio = 0 (no reservation)
+                mode.reference_market_ratio = trading_constants.ZERO
+                reference_market_to_split = decimal.Decimal("2000")
+                reference_market_reserved = reference_market_to_split * mode.reference_market_ratio
+                reference_market_to_distribute = reference_market_to_split - reference_market_reserved
+                
                 assert await consumer._split_reference_market_into_indexed_coins(
                     details, is_simple_buy_without_selling, dependencies
                 ) == ["order"]
                 _get_symbols_and_amounts_mock.assert_called_once()
+                # Verify _get_symbols_and_amounts was called with correct reference_market_to_distribute
+                assert _get_symbols_and_amounts_mock.call_args[0][2] == reference_market_to_distribute
+                assert reference_market_reserved == trading_constants.ZERO
+                assert reference_market_to_distribute == reference_market_to_split
                 _get_symbols_and_amounts_mock.reset_mock()
                 get_currency_portfolio_mock.assert_not_called()
                 get_traded_assets_holdings_value_mock.assert_called_once_with("USDT", None)
                 _get_simple_buy_coins_mock.assert_called_once_with(details)
                 assert _buy_coin_mock.call_count == 1
                 assert _buy_coin_mock.mock_calls[0].args[0] == "ETH/USDT"
-                assert _buy_coin_mock.mock_calls[0].args[2] == dependencies
+                assert _buy_coin_mock.mock_calls[0].args[3] == dependencies
+                
+                # Test with reference_market_ratio > 0 (with reservation)
+                get_traded_assets_holdings_value_mock.reset_mock()
+                _buy_coin_mock.reset_mock()
+                _get_simple_buy_coins_mock.reset_mock()
+                mode.reference_market_ratio = decimal.Decimal("0.2")  # 20% to trade
+                reference_market_to_split = decimal.Decimal("2000")
+                reference_market_to_distribute = reference_market_to_split * mode.reference_market_ratio
+                reference_market_reserved = reference_market_to_split - reference_market_to_distribute
+                
+                assert await consumer._split_reference_market_into_indexed_coins(
+                    details, is_simple_buy_without_selling, dependencies
+                ) == ["order"]
+                _get_symbols_and_amounts_mock.assert_called_once()
+                # Verify _get_symbols_and_amounts was called with correct reference_market_to_distribute
+                assert _get_symbols_and_amounts_mock.call_args[0][2] == reference_market_to_distribute
+                assert reference_market_to_distribute == decimal.Decimal("400")
+                assert reference_market_reserved == decimal.Decimal("1600")
+                _get_symbols_and_amounts_mock.reset_mock()
+                get_traded_assets_holdings_value_mock.assert_called_once_with("USDT", None)
+                _get_simple_buy_coins_mock.assert_called_once_with(details)
+                _buy_coin_mock.reset_mock()
 
-async def test_get_symbols_and_amounts(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_get_symbols_and_amounts(trading_tools):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     trader.exchange_manager.exchange_config.traded_symbols = [
         commons_symbols.parse_symbol(symbol)
         for symbol in ["BTC/USDT"]
     ]
     mode.ensure_updated_coins_distribution()
-    assert await consumer._get_symbols_and_amounts(["BTC"], decimal.Decimal(3000)) == {
-        "BTC/USDT": decimal.Decimal(3)
-    }
     with mock.patch.object(
             trading_personal_data, "get_up_to_date_price", mock.AsyncMock(return_value=decimal.Decimal(1000))
     ) as get_up_to_date_price_mock:
-        assert await consumer._get_symbols_and_amounts(["BTC", "ETH"], decimal.Decimal(3000)) == {
-            "BTC/USDT": decimal.Decimal(3)
+        assert await consumer._get_symbols_and_amounts(["BTC"], {}, decimal.Decimal(3000)) == {
+            "BTC/USDT": {
+                consumer.IDEAL_AMOUNT: decimal.Decimal(3),
+                consumer.IDEAL_PRICE: decimal.Decimal(1000)
+            }
+        }
+        assert get_up_to_date_price_mock.call_count == 1
+        get_up_to_date_price_mock.reset_mock()
+        assert await consumer._get_symbols_and_amounts(["BTC", "ETH"], {}, decimal.Decimal(3000)) == {
+            "BTC/USDT": {
+                consumer.IDEAL_AMOUNT: decimal.Decimal(3),
+                consumer.IDEAL_PRICE: decimal.Decimal(1000)
+            }
         }
         assert get_up_to_date_price_mock.call_count == 2
         get_up_to_date_price_mock.reset_mock()
@@ -1879,20 +2829,62 @@ async def test_get_symbols_and_amounts(tools):
             for symbol in ["BTC/USDT", "ETH/USDT"]
         ]
         mode.ensure_updated_coins_distribution()
-        assert await consumer._get_symbols_and_amounts(["BTC", "ETH"], decimal.Decimal(3000)) == {
-            "BTC/USDT": decimal.Decimal("1.5"),
-            "ETH/USDT": decimal.Decimal("1.5")
+        assert await consumer._get_symbols_and_amounts(["BTC", "ETH"], {}, decimal.Decimal(3000)) == {
+            "BTC/USDT": {
+                consumer.IDEAL_AMOUNT: decimal.Decimal("1.5"),
+                consumer.IDEAL_PRICE: decimal.Decimal(1000)
+            },
+            "ETH/USDT": {
+                consumer.IDEAL_AMOUNT: decimal.Decimal("1.5"),
+                consumer.IDEAL_PRICE: decimal.Decimal(1000)
+            }
         }
         assert get_up_to_date_price_mock.call_count == 2
 
+    # enough funds
+    trader.exchange_manager.exchange_config.traded_symbols = [
+        commons_symbols.parse_symbol(symbol)
+        for symbol in ["BTC/USDT"]
+    ]
+    mode.ensure_updated_coins_distribution()
+    mode.min_order_size_margin = decimal.Decimal("2")
+    with mock.patch.object(
+            trading_personal_data, "get_up_to_date_price", mock.AsyncMock(return_value=decimal.Decimal(1000))
+    ), mock.patch.object(
+            trading_personal_data,
+            "decimal_check_and_adapt_order_details_if_necessary",
+            mock.Mock(return_value=decimal.Decimal("1"))
+    ) as decimal_check_mock:
+        await consumer._get_symbols_and_amounts(["BTC"], {}, decimal.Decimal(3000))
+        assert decimal_check_mock.call_args[0][0] == decimal.Decimal("1.5")
+
+    # not enough funds due to too much margin
+    mode.min_order_size_margin = decimal.Decimal("10")
+    with mock.patch.object(
+            trading_personal_data, "get_up_to_date_price", mock.AsyncMock(return_value=decimal.Decimal(1000))
+    ), mock.patch.object(
+            trading_personal_data,
+            "decimal_check_and_adapt_order_details_if_necessary",
+            mock.Mock(return_value=None)
+    ) as decimal_check_mock:
+        with pytest.raises(trading_errors.MissingMinimalExchangeTradeVolume):
+            await consumer._get_symbols_and_amounts(["BTC"], {}, decimal.Decimal(3000))
+        assert decimal_check_mock.call_args[0][0] == decimal.Decimal("0.3")
+
     # not enough funds
     with pytest.raises(trading_errors.MissingMinimalExchangeTradeVolume):
-        await consumer._get_symbols_and_amounts(["BTC"], decimal.Decimal(0.0003))
+        await consumer._get_symbols_and_amounts(["BTC"], {}, decimal.Decimal(0.0003))
+
+    # not enough funds but skipping allowed so it doesn't raise
+    mode.allow_skip_asset = True
+    assert await consumer._get_symbols_and_amounts(["BTC"], {}, decimal.Decimal(0.0003)) == {}
+    mode.allow_skip_asset = False
+
     with mock.patch.object(
             trading_personal_data, "get_up_to_date_price", mock.AsyncMock(return_value=decimal.Decimal(0.000000001))
     ) as get_up_to_date_price_mock:
         with pytest.raises(trading_errors.MissingMinimalExchangeTradeVolume):
-            await consumer._get_symbols_and_amounts(["BTC", "ETH"], decimal.Decimal(0.01))
+            await consumer._get_symbols_and_amounts(["BTC", "ETH"], {}, decimal.Decimal(0.01))
         assert get_up_to_date_price_mock.call_count == 1
 
     # with ref market in coins config
@@ -1916,26 +2908,60 @@ async def test_get_symbols_and_amounts(tools):
             trading_personal_data, "get_up_to_date_price", mock.AsyncMock(return_value=decimal.Decimal(1000))
     ) as get_up_to_date_price_mock:
         # USDT is not counted in orders to create (nothing to buy as USDT is the reference market everything is sold to)
-        assert await consumer._get_symbols_and_amounts(["BTC", "USDT"], decimal.Decimal(3000)) == {
-            "BTC/USDT": decimal.Decimal("2.1")
+        assert await consumer._get_symbols_and_amounts(["BTC", "USDT"], {}, decimal.Decimal(3000)) == {
+            "BTC/USDT": {
+                consumer.IDEAL_AMOUNT: decimal.Decimal("2.1"),
+                consumer.IDEAL_PRICE: decimal.Decimal(1000)
+            }
         }
         assert get_up_to_date_price_mock.call_count == 1
 
 
-async def test_buy_coin(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_buy_coin(trading_tools):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     portfolio = trader.exchange_manager.exchange_personal_data.portfolio_manager.portfolio.portfolio
     dependencies = trading_signals.get_orders_dependencies([mock.Mock(order_id="123")])
+    is_futures = trader.exchange_manager.is_future
+    positions_manager = trader.exchange_manager.exchange_personal_data.positions_manager
     with mock.patch.object(mode, "create_order", mock.AsyncMock(side_effect=lambda x, **kwargs: x)) as create_order_mock:
         # coin already held
         portfolio["BTC"].available = decimal.Decimal(20)
-        assert await consumer._buy_coin("BTC/USDT", decimal.Decimal(2), dependencies) == []
+        # For futures, mock position to have size >= ideal_amount so it returns empty
+        def _get_symbol_position(symbol, side=None):
+            return _create_position_mock(
+                symbol, trader, is_futures,
+                is_idle=False,
+                size=decimal.Decimal(2),  # Already at target
+                side=trading_enums.PositionSide.LONG,
+            )
+        with mock.patch.object(
+            positions_manager, "get_symbol_position", mock.Mock(side_effect=_get_symbol_position)
+        ), \
+        mock.patch.object(
+            order_util, "get_futures_max_order_size", mock.Mock(return_value=(decimal.Decimal(10), True))
+        ):
+            assert await consumer.trading_mode.rebalancer.buy_coin("BTC/USDT", decimal.Decimal(2), None, dependencies) == []
         create_order_mock.assert_not_called()
 
         # coin already partially held
         portfolio["BTC"].available = decimal.Decimal(0.5)
-        orders = await consumer._buy_coin("BTC/USDT", decimal.Decimal(2), dependencies)
+        # For futures, mock position to have size 0.5 so we need to buy 1.5 more (2 - 0.5 = 1.5)
+        def _get_symbol_position(symbol, side=None):
+            return _create_position_mock(
+                symbol, trader, is_futures,
+                is_idle=False,
+                size=decimal.Decimal(0.5),  # Already have 0.5, need 1.5 more to reach 2
+                side=trading_enums.PositionSide.LONG,
+            )
+        with mock.patch.object(
+            positions_manager, "get_symbol_position", mock.Mock(side_effect=_get_symbol_position)
+        ), \
+        mock.patch.object(
+            order_util, "get_futures_max_order_size", mock.Mock(return_value=(decimal.Decimal(10), True))
+        ):
+            orders = await consumer.trading_mode.rebalancer.buy_coin("BTC/USDT", decimal.Decimal(2), None, dependencies)
         assert len(orders) == 1
         create_order_mock.assert_called_once_with(orders[0], dependencies=dependencies)
         assert isinstance(orders[0], trading_personal_data.BuyMarketOrder)
@@ -1947,7 +2973,19 @@ async def test_buy_coin(tools):
 
         # coin not already held
         portfolio["BTC"].available = decimal.Decimal(0)
-        orders = await consumer._buy_coin("BTC/USDT", decimal.Decimal(2), dependencies)
+        # For futures, mock position to be idle (no position)
+        def _get_symbol_position(symbol, side=None):
+            return _create_position_mock(
+                symbol, trader, is_futures,
+                is_idle=True,
+            )
+        with mock.patch.object(
+            positions_manager, "get_symbol_position", mock.Mock(side_effect=_get_symbol_position)
+        ), \
+        mock.patch.object(
+            order_util, "get_futures_max_order_size", mock.Mock(return_value=(decimal.Decimal(10), True))
+        ):
+            orders = await consumer.trading_mode.rebalancer.buy_coin("BTC/USDT", decimal.Decimal(2), None, dependencies)
         assert len(orders) == 1
         create_order_mock.assert_called_once_with(orders[0], dependencies=dependencies)
         assert isinstance(orders[0], trading_personal_data.BuyMarketOrder)
@@ -1958,7 +2996,18 @@ async def test_buy_coin(tools):
         create_order_mock.reset_mock()
 
         # given ideal_amount is lower
-        orders = await consumer._buy_coin("BTC/USDT", decimal.Decimal("0.025"), dependencies)
+        def _get_symbol_position(symbol, side=None):
+            return _create_position_mock(
+                symbol, trader, is_futures,
+                is_idle=True,
+            )
+        with mock.patch.object(
+            positions_manager, "get_symbol_position", mock.Mock(side_effect=_get_symbol_position)
+        ), \
+        mock.patch.object(
+            order_util, "get_futures_max_order_size", mock.Mock(return_value=(decimal.Decimal(1), True))
+        ):
+            orders = await consumer.trading_mode.rebalancer.buy_coin("BTC/USDT", decimal.Decimal("0.025"), None, dependencies)
         assert len(orders) == 1
         create_order_mock.assert_called_once_with(orders[0], dependencies=dependencies)
         assert isinstance(orders[0], trading_personal_data.BuyMarketOrder)
@@ -1976,8 +3025,23 @@ async def test_buy_coin(tools):
                     trading_enums.FeePropertyColumns.CURRENCY.value: "USDT",
                 })
         ) as get_trade_fee_mock:
-            orders = await consumer._buy_coin("BTC/USDT", decimal.Decimal("0.5"), dependencies)
-            assert get_trade_fee_mock.call_count == 2
+            def _get_symbol_position(symbol, side=None):
+                return _create_position_mock(
+                    symbol, trader, is_futures,
+                    is_idle=True,
+                )
+            with mock.patch.object(
+                positions_manager, "get_symbol_position", mock.Mock(side_effect=_get_symbol_position)
+            ), \
+            mock.patch.object(
+                order_util, "get_futures_max_order_size", mock.Mock(return_value=(decimal.Decimal(10), True))
+            ):
+                orders = await consumer.trading_mode.rebalancer.buy_coin("BTC/USDT", decimal.Decimal("0.5"), None, dependencies)
+            if is_futures:
+                # For futures, get_trade_fee is not called in decimal_adapt_order_quantity_because_fees
+                assert get_trade_fee_mock.call_count == 0
+            else:
+                assert get_trade_fee_mock.call_count == 2
             assert len(orders) == 1
             create_order_mock.assert_called_once_with(orders[0], dependencies=dependencies)
             assert isinstance(orders[0], trading_personal_data.BuyMarketOrder)
@@ -1989,25 +3053,87 @@ async def test_buy_coin(tools):
             create_order_mock.reset_mock()
             get_trade_fee_mock.reset_mock()
 
-            orders = await consumer._buy_coin("BTC/USDT", decimal.Decimal(2), dependencies)
-            assert get_trade_fee_mock.call_count == 2
+            def _get_symbol_position(symbol, side=None):
+                return _create_position_mock(
+                    symbol, trader, is_futures,
+                    is_idle=True,
+                )
+            
+            with mock.patch.object(
+                positions_manager, "get_symbol_position", mock.Mock(side_effect=_get_symbol_position)
+            ), \
+            mock.patch.object(
+                order_util, "get_futures_max_order_size", mock.Mock(return_value=(decimal.Decimal(10), True))
+            ):
+                orders = await consumer.trading_mode.rebalancer.buy_coin("BTC/USDT", decimal.Decimal(2), None, dependencies)
+            if is_futures:
+                # For futures, get_trade_fee is not called in decimal_adapt_order_quantity_because_fees
+                assert get_trade_fee_mock.call_count == 0
+            else:
+                assert get_trade_fee_mock.call_count == 2
             assert len(orders) == 1
             create_order_mock.assert_called_once_with(orders[0], dependencies=dependencies)
             assert isinstance(orders[0], trading_personal_data.BuyMarketOrder)
             assert orders[0].symbol == "BTC/USDT"
             assert orders[0].origin_price == decimal.Decimal(1000)
-            btc_fees = fee_usdt_cost / orders[0].origin_price
-            # 2 - fees denominated in BTC
-            assert orders[0].origin_quantity == decimal.Decimal("2") - btc_fees * trading_constants.FEES_SAFETY_MARGIN
-            assert orders[0].total_cost == decimal.Decimal('1987.5000')
+            if is_futures:
+                # For futures, fees are not deducted in decimal_adapt_order_quantity_because_fees
+                assert orders[0].origin_quantity == decimal.Decimal("2")
+                assert orders[0].total_cost == decimal.Decimal("2000")
+            else:
+                btc_fees = fee_usdt_cost / orders[0].origin_price
+                # 2 - fees denominated in BTC
+                assert orders[0].origin_quantity == decimal.Decimal("2") - btc_fees * trading_constants.FEES_SAFETY_MARGIN
+                assert orders[0].total_cost == decimal.Decimal('1987.5000')
             create_order_mock.reset_mock()
 
 
-async def test_buy_coin_using_limit_order(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_buy_coin_does_not_duplicate_with_pending_open_orders(trading_tools):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, _, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
+    dependencies = trading_signals.get_orders_dependencies([mock.Mock(order_id="123")])
+    is_futures = trader.exchange_manager.is_future
+    positions_manager = trader.exchange_manager.exchange_personal_data.positions_manager
+    orders_manager = trader.exchange_manager.exchange_personal_data.orders_manager
+    portfolio = trader.exchange_manager.exchange_personal_data.portfolio_manager.portfolio.portfolio
+
+    pending_buy_order = mock.Mock(
+        symbol="BTC/USDT",
+        origin_quantity=decimal.Decimal("2"),
+        filled_quantity=decimal.Decimal("0"),
+        side=trading_enums.TradeOrderSide.BUY,
+    )
+    portfolio["BTC"].available = decimal.Decimal("0")
+    with mock.patch.object(mode, "create_order", mock.AsyncMock(side_effect=lambda x, **kwargs: x)) as create_order_mock, \
+        mock.patch.object(
+            orders_manager, "get_open_orders", mock.Mock(return_value=[pending_buy_order])
+        ), \
+        mock.patch.object(
+            order_util, "get_futures_max_order_size", mock.Mock(return_value=(decimal.Decimal("10"), True))
+        ):
+        def _get_symbol_position(symbol, side=None):
+            return _create_position_mock(
+                symbol, trader, is_futures,
+                is_idle=True,
+            )
+        with mock.patch.object(
+            positions_manager, "get_symbol_position", mock.Mock(side_effect=_get_symbol_position)
+        ):
+            orders = await consumer.trading_mode.rebalancer.buy_coin("BTC/USDT", decimal.Decimal("2"), None, dependencies)
+
+    assert orders == [] # order already exists, we should not create a new one
+    create_order_mock.assert_not_called()
+
+
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_buy_coin_using_limit_order(trading_tools):
+    update = {}
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     portfolio = trader.exchange_manager.exchange_personal_data.portfolio_manager.portfolio.portfolio
     dependencies = trading_signals.get_orders_dependencies([mock.Mock(order_id="123")])
+    is_futures = trader.exchange_manager.is_future
+    positions_manager = trader.exchange_manager.exchange_personal_data.positions_manager
     with mock.patch.object(
             mode,
             "create_order", mock.AsyncMock(side_effect=lambda x, **kwargs: x)
@@ -2017,13 +3143,41 @@ async def test_buy_coin_using_limit_order(tools):
     ) as is_market_open_for_order_type_mock:
         # coin already held
         portfolio["BTC"].available = decimal.Decimal(20)
-        assert await consumer._buy_coin("BTC/USDT", decimal.Decimal(2), dependencies) == []
+        # For futures, mock position to have size >= ideal_amount so it returns empty
+        def _get_symbol_position(symbol, side=None):
+            return _create_position_mock(
+                symbol, trader, is_futures,
+                is_idle=False,
+                size=decimal.Decimal(2),  # Already at target
+                side=trading_enums.PositionSide.LONG,
+            )
+        with mock.patch.object(
+            positions_manager, "get_symbol_position", mock.Mock(side_effect=_get_symbol_position)
+        ), \
+        mock.patch.object(
+            order_util, "get_futures_max_order_size", mock.Mock(return_value=(decimal.Decimal(10), True))
+        ):
+            assert await consumer.trading_mode.rebalancer.buy_coin("BTC/USDT", decimal.Decimal(2), None, dependencies) == []
         create_order_mock.assert_not_called()
         is_market_open_for_order_type_mock.assert_not_called()
 
         # coin already partially held: buy more using limit order
         portfolio["BTC"].available = decimal.Decimal(0.5)
-        orders = await consumer._buy_coin("BTC/USDT", decimal.Decimal(2), dependencies)
+        # For futures, mock position to have size 0.5 so we need to buy 1.5 more (2 - 0.5 = 1.5)
+        def _get_symbol_position(symbol, side=None):
+            return _create_position_mock(
+                symbol, trader, is_futures,
+                is_idle=False,
+                size=decimal.Decimal(0.5),  # Already have 0.5, need 1.5 more to reach 2
+                side=trading_enums.PositionSide.LONG,
+            )
+        with mock.patch.object(
+            positions_manager, "get_symbol_position", mock.Mock(side_effect=_get_symbol_position)
+        ), \
+        mock.patch.object(
+            order_util, "get_futures_max_order_size", mock.Mock(return_value=(decimal.Decimal(10), True))
+        ):
+            orders = await consumer.trading_mode.rebalancer.buy_coin("BTC/USDT", decimal.Decimal(2), None, dependencies)
         assert len(orders) == 1
         is_market_open_for_order_type_mock.assert_called_once_with("BTC/USDT", trading_enums.TraderOrderType.BUY_MARKET)
         create_order_mock.assert_called_once_with(orders[0], dependencies=dependencies)
@@ -2037,7 +3191,19 @@ async def test_buy_coin_using_limit_order(tools):
 
         # coin not already held
         portfolio["BTC"].available = decimal.Decimal(0)
-        orders = await consumer._buy_coin("BTC/USDT", decimal.Decimal(2), dependencies)
+        # For futures, mock position to be idle (no position)
+        def _get_symbol_position(symbol, side=None):
+            return _create_position_mock(
+                symbol, trader, is_futures,
+                is_idle=True,
+            )
+        with mock.patch.object(
+            positions_manager, "get_symbol_position", mock.Mock(side_effect=_get_symbol_position)
+        ), \
+        mock.patch.object(
+            order_util, "get_futures_max_order_size", mock.Mock(return_value=(decimal.Decimal(10), True))
+        ):
+            orders = await consumer.trading_mode.rebalancer.buy_coin("BTC/USDT", decimal.Decimal(2), None, dependencies)
         assert len(orders) == 1
         is_market_open_for_order_type_mock.assert_called_once_with("BTC/USDT", trading_enums.TraderOrderType.BUY_MARKET)
         create_order_mock.assert_called_once_with(orders[0], dependencies=dependencies)
@@ -2050,14 +3216,25 @@ async def test_buy_coin_using_limit_order(tools):
         is_market_open_for_order_type_mock.reset_mock()
 
         # given ideal_amount is lower
-        orders = await consumer._buy_coin("BTC/USDT", decimal.Decimal("0.025"), dependencies)
+        def _get_symbol_position(symbol, side=None):
+            return _create_position_mock(
+                symbol, trader, is_futures,
+                is_idle=True,
+            )
+        with mock.patch.object(
+            positions_manager, "get_symbol_position", mock.Mock(side_effect=_get_symbol_position)
+        ), \
+        mock.patch.object(
+            order_util, "get_futures_max_order_size", mock.Mock(return_value=(decimal.Decimal(1), True))
+        ):
+            orders = await consumer.trading_mode.rebalancer.buy_coin("BTC/USDT", decimal.Decimal("0.025"), None, dependencies)
         assert len(orders) == 1
         is_market_open_for_order_type_mock.assert_called_once_with("BTC/USDT", trading_enums.TraderOrderType.BUY_MARKET)
         create_order_mock.assert_called_once_with(orders[0], dependencies=dependencies)
         assert isinstance(orders[0], trading_personal_data.BuyLimitOrder)
         assert orders[0].symbol == "BTC/USDT"
         assert orders[0].origin_price == decimal.Decimal(1005)
-        assert orders[0].origin_quantity == decimal.Decimal('0.02487562')  # use 100 instead of all 2000 USDT in pf
+        assert orders[0].origin_quantity == decimal.Decimal('0.02487562')  # use 100 instead of all 2000 USDT in pf, adjusted for limit price
         assert decimal.Decimal('24.999') < orders[0].total_cost < decimal.Decimal("25")
         create_order_mock.reset_mock()
         is_market_open_for_order_type_mock.reset_mock()
@@ -2070,8 +3247,23 @@ async def test_buy_coin_using_limit_order(tools):
                     trading_enums.FeePropertyColumns.CURRENCY.value: "USDT",
                 })
         ) as get_trade_fee_mock:
-            orders = await consumer._buy_coin("BTC/USDT", decimal.Decimal("0.5"), dependencies)
-            assert get_trade_fee_mock.call_count == 2
+            def _get_symbol_position(symbol, side=None):
+                return _create_position_mock(
+                    symbol, trader, is_futures,
+                    is_idle=True,
+                )
+            with mock.patch.object(
+                positions_manager, "get_symbol_position", mock.Mock(side_effect=_get_symbol_position)
+            ), \
+            mock.patch.object(
+                order_util, "get_futures_max_order_size", mock.Mock(return_value=(decimal.Decimal(10), True))
+            ):
+                orders = await consumer.trading_mode.rebalancer.buy_coin("BTC/USDT", decimal.Decimal("0.5"), None, dependencies)
+            if is_futures:
+                # For futures, get_trade_fee is not called in decimal_adapt_order_quantity_because_fees
+                assert get_trade_fee_mock.call_count == 0
+            else:
+                assert get_trade_fee_mock.call_count == 2
             assert len(orders) == 1
             is_market_open_for_order_type_mock.assert_called_once_with("BTC/USDT", trading_enums.TraderOrderType.BUY_MARKET)
             create_order_mock.assert_called_once_with(orders[0], dependencies=dependencies)
@@ -2085,25 +3277,72 @@ async def test_buy_coin_using_limit_order(tools):
             get_trade_fee_mock.reset_mock()
             is_market_open_for_order_type_mock.reset_mock()
 
-            orders = await consumer._buy_coin("BTC/USDT", decimal.Decimal(2), dependencies)
-            assert get_trade_fee_mock.call_count == 2
+            def _get_symbol_position(symbol, side=None):
+                return _create_position_mock(
+                    symbol, trader, is_futures,
+                    is_idle=True,
+                )
+            with mock.patch.object(
+                positions_manager, "get_symbol_position", mock.Mock(side_effect=_get_symbol_position)
+            ), \
+            mock.patch.object(
+                order_util, "get_futures_max_order_size", mock.Mock(return_value=(decimal.Decimal(10), True))
+            ):
+                orders = await consumer.trading_mode.rebalancer.buy_coin("BTC/USDT", decimal.Decimal(2), None, dependencies)
+            if is_futures:
+                # For futures, get_trade_fee is not called in decimal_adapt_order_quantity_because_fees
+                assert get_trade_fee_mock.call_count == 0
+            else:
+                assert get_trade_fee_mock.call_count == 2
             assert len(orders) == 1
             is_market_open_for_order_type_mock.assert_called_once_with("BTC/USDT", trading_enums.TraderOrderType.BUY_MARKET)
             create_order_mock.assert_called_once_with(orders[0], dependencies=dependencies)
             assert isinstance(orders[0], trading_personal_data.BuyLimitOrder)
             assert orders[0].symbol == "BTC/USDT"
             assert orders[0].origin_price == decimal.Decimal(1005)
-            # 2 - fees denominated in BTC
-            symbol_market = trader.exchange_manager.exchange.get_market_status(orders[0].symbol, with_fixer=False)
-            assert orders[0].origin_quantity == trading_personal_data.decimal_adapt_quantity(
-                symbol_market,
-                (
-                    decimal.Decimal("2000") - fee_usdt_cost * trading_constants.FEES_SAFETY_MARGIN
-                ) / orders[0].origin_price
-            )
-            assert decimal.Decimal('1985') < orders[0].total_cost < decimal.Decimal('1990')
+            if not is_futures:
+                # 2 - fees denominated in BTC
+                symbol_market = trader.exchange_manager.exchange.get_market_status(orders[0].symbol, with_fixer=False)
+                assert orders[0].origin_quantity == trading_personal_data.decimal_adapt_quantity(
+                    symbol_market,
+                    (
+                        decimal.Decimal("2000") - fee_usdt_cost * trading_constants.FEES_SAFETY_MARGIN
+                    ) / orders[0].origin_price
+                )
+            assert decimal.Decimal('1985') < orders[0].total_cost < decimal.Decimal('2000')
             create_order_mock.reset_mock()
             is_market_open_for_order_type_mock.reset_mock()
+
+        # test price threshold to use market order
+        # Current price is 1000, threshold is PRICE_THRESHOLD_TO_USE_MARKET_ORDER (0.01 = 1%)
+        # Threshold price = 1000 * (1 - 0.01) = 990
+        # If ideal_price >= 990, should try market order
+        # If ideal_price < 990, should use limit order
+        current_price = decimal.Decimal(1000)
+        price_threshold = mode.rebalancer.PRICE_THRESHOLD_TO_USE_MARKET_ORDER
+        threshold_price = current_price * (decimal.Decimal(1) - price_threshold)
+    
+        # ideal_price just below threshold (should use limit order)
+        price_below_threshold = threshold_price - decimal.Decimal("0.01")
+        def _get_symbol_position(symbol, side=None):
+            return _create_position_mock(
+                symbol, trader, is_futures,
+                is_idle=True,
+            )
+        with mock.patch.object(
+            positions_manager, "get_symbol_position", mock.Mock(side_effect=_get_symbol_position)
+        ), \
+        mock.patch.object(
+            order_util, "get_futures_max_order_size", mock.Mock(return_value=(decimal.Decimal(10), True))
+        ):
+            orders = await consumer.trading_mode.rebalancer.buy_coin("BTC/USDT", decimal.Decimal(2), price_below_threshold, dependencies)
+        assert len(orders) == 1
+        # Should use limit order since price is below threshold
+        is_market_open_for_order_type_mock.assert_called_once_with("BTC/USDT", trading_enums.TraderOrderType.BUY_LIMIT)
+        create_order_mock.reset_mock()
+        is_market_open_for_order_type_mock.reset_mock()
+
+    
 
 
 async def _get_tools(symbol="BTC/USDT"):
@@ -2147,6 +3386,73 @@ async def _get_tools(symbol="BTC/USDT"):
 
     return mode, trader
 
+def _support_contract(exchange_manager, symbol, contract: trading_exchange_data.Contract):
+    contract = contract(
+        pair=symbol,
+        margin_type=trading_enums.MarginType.ISOLATED,
+        contract_type=trading_enums.FutureContractType.LINEAR_PERPETUAL,
+        current_leverage=trading_constants.ONE,
+        maximum_leverage=trading_constants.ONE_HUNDRED
+    )
+    exchange_manager.exchange.set_pair_contract(symbol, contract)
+
+async def _get_futures_tools(symbol="BTC/USDT"):
+    config = test_config.load_test_config()
+    config[commons_constants.CONFIG_SIMULATOR][commons_constants.CONFIG_STARTING_PORTFOLIO]["USDT"] = 2000
+    exchange_manager = test_exchanges.get_test_exchange_manager(config, "binance")
+    exchange_manager.tentacles_setup_config = test_utils_config.get_tentacles_setup_config()
+
+    # use backtesting not to spam exchanges apis
+    exchange_manager.is_spot_only = False
+    exchange_manager.is_future = True
+    exchange_manager.is_simulated = True
+    exchange_manager.is_backtesting = True
+    exchange_manager.use_cached_markets = False
+    backtesting = await backtesting_api.initialize_backtesting(
+        config,
+        exchange_ids=[exchange_manager.id],
+        matrix_id=None,
+        data_files=[os.path.join(test_config.TEST_CONFIG_FOLDER,
+                                 "AbstractExchangeHistoryCollector_1586017993.616272.data")])
+    exchange_manager.exchange = exchanges.ExchangeSimulator(
+        exchange_manager.config, exchange_manager, backtesting
+    )
+    await exchange_manager.exchange.initialize()
+    exchange_manager.exchange_config.set_config_traded_pairs()
+    # Ensure the futures symbol is in traded_symbols for index trading mode to work correctly
+    parsed_symbol = commons_symbols.parse_symbol(symbol)
+    if parsed_symbol not in exchange_manager.exchange_config.traded_symbols:
+        exchange_manager.exchange_config.traded_symbols.append(parsed_symbol)
+        exchange_manager.exchange_config.traded_symbol_pairs.append(symbol)
+    for exchange_channel_class_type in [exchanges_channel.ExchangeChannel, exchanges_channel.TimeFrameExchangeChannel]:
+        await channel_util.create_all_subclasses_channel(exchange_channel_class_type, exchanges_channel.set_chan,
+                                                         exchange_manager=exchange_manager)
+    
+    # Create contracts for all traded symbols
+    for contract_symbol in TRADED_SYMBOLS:
+        _support_contract(exchange_manager, contract_symbol, trading_exchange_data.FutureContract)
+
+    trader = exchanges.TraderSimulator(config, exchange_manager)
+    await trader.initialize()
+    exchange_manager.exchange_personal_data.portfolio_manager.reference_market = "USDT"
+
+    mode = Mode.IndexTradingMode(config, exchange_manager)
+    mode.symbol = None if mode.get_is_symbol_wildcard() else symbol
+    # trading mode is not initialized: to be initialized with the required config in tests
+
+    # add mode to exchange manager so that it can be stopped and freed from memory
+    exchange_manager.trading_modes.append(mode)
+
+    # Initialize mark prices for all traded symbols
+    for traded_symbol in TRADED_SYMBOLS:
+        if traded_symbol == symbol:
+            # set symbol price at 1000 USDT
+            trading_api.force_set_mark_price(exchange_manager, symbol, 1000)
+        else:
+            trading_api.force_set_mark_price(trader.exchange_manager, traded_symbol, 1)
+
+    return mode, trader
+
 
 async def _init_mode(tools, config):
     mode, trader = tools
@@ -2161,9 +3467,10 @@ async def _stop(exchange_manager):
     await exchange_manager.stop()
 
 
-async def test_automatically_update_historical_config_on_set_intervals(tools):
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_automatically_update_historical_config_on_set_intervals(trading_tools):
     update = {}
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, update))
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, update))
     
     # Test with SELL_REMOVED_INDEX_COINS_AS_SOON_AS_POSSIBLE policy
     mode.synchronization_policy = index_trading.SynchronizationPolicy.SELL_REMOVED_INDEX_COINS_AS_SOON_AS_POSSIBLE
@@ -2189,9 +3496,9 @@ async def test_automatically_update_historical_config_on_set_intervals(tools):
         supports_historical_config_mock.assert_called_once()
         supports_historical_config_mock.reset_mock()
 
-
-async def test_ensure_updated_coins_distribution(tools):
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, {}))
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_ensure_updated_coins_distribution(trading_tools):
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, {}))
     trader.exchange_manager.exchange_config.traded_symbols = [
         commons_symbols.parse_symbol(symbol)
         for symbol in ["ETH/USDT", "SOL/USDT", "BTC/USDT"]
@@ -2268,8 +3575,9 @@ async def test_ensure_updated_coins_distribution(tools):
         assert mode.indexed_coins == ["BTC", "ETH", "USDT"]
 
 
-async def test_get_supported_distribution(tools):
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, {}))
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_get_supported_distribution(trading_tools):
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, {}))
     trader.exchange_manager.exchange_config.traded_symbols = [
         commons_symbols.parse_symbol(symbol)
         for symbol in ["BTC/USDT", "ETH/USDT", "SOL/USDT", "ADA/USDT"]
@@ -2466,8 +3774,9 @@ async def test_get_supported_distribution(tools):
             get_ideal_distribution_mock.reset_mock()
 
 
-async def test_get_currently_applied_historical_config_according_to_holdings(tools):
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, {}))
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_get_currently_applied_historical_config_according_to_holdings(trading_tools):
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, {}))
     trader.exchange_manager.exchange_config.traded_symbols = [
         commons_symbols.parse_symbol(symbol)
         for symbol in ["BTC/USDT", "ETH/USDT", "SOL/USDT", "ADA/USDT"]
@@ -2564,8 +3873,9 @@ async def test_get_currently_applied_historical_config_according_to_holdings(too
             _is_index_config_applied_mock.reset_mock()
 
 
-async def test_is_index_config_applied(tools):
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, {}))
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_is_index_config_applied(trading_tools):
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, {}))
     trader.exchange_manager.exchange_config.traded_symbols = [
         commons_symbols.parse_symbol(symbol)
         for symbol in ["BTC/USDT", "ETH/USDT", "SOL/USDT", "ADA/USDT"]
@@ -2574,6 +3884,9 @@ async def test_is_index_config_applied(tools):
         symbol.base
         for symbol in trader.exchange_manager.exchange_config.traded_symbols
     )
+    is_futures = trader.exchange_manager.is_future
+    positions_manager = trader.exchange_manager.exchange_personal_data.positions_manager
+    portfolio_value_holder = trader.exchange_manager.exchange_personal_data.portfolio_manager.portfolio_value_holder
     
     # Test 1: No ideal distribution - should return False
     config_without_distribution = {}
@@ -2622,18 +3935,63 @@ async def test_is_index_config_applied(tools):
     }
     
     # Mock holdings ratios to match target ratios exactly
-    with mock.patch.object(
-        trader.exchange_manager.exchange_personal_data.portfolio_manager.portfolio_value_holder,
-        "get_holdings_ratio", mock.Mock(side_effect=lambda coin, **kwargs: {
-            "BTC": decimal.Decimal("0.6"),  # 60% target
-            "ETH": decimal.Decimal("0.4"),  # 40% target
-        }.get(coin, decimal.Decimal("0")))
-    ) as get_holdings_ratio_mock:
-        assert mode._is_index_config_applied(config_with_valid_distribution, traded_bases) is True
-        assert get_holdings_ratio_mock.call_count == 2
-        assert get_holdings_ratio_mock.mock_calls[0].args[0] == "BTC"
-        assert get_holdings_ratio_mock.mock_calls[1].args[0] == "ETH"
-        get_holdings_ratio_mock.reset_mock()
+    # For futures, also need to mock positions and get_traded_assets_holdings_value
+    total_portfolio_value = decimal.Decimal("1000")
+    btc_position_value = total_portfolio_value * decimal.Decimal("0.6")  # 600
+    eth_position_value = total_portfolio_value * decimal.Decimal("0.4")  # 400
+    
+    def _get_symbol_position(symbol, side=None):
+        position_mock = mock.Mock()
+        position_mock.symbol = symbol
+        position_mock.side = side or trading_enums.PositionSide.LONG
+        if is_futures:
+            # Match symbol by checking if it contains the coin name (handles both "BTC/USDT" and "BTC/USDT:USDT")
+            symbol_str = str(symbol) if not isinstance(symbol, str) else symbol
+            if "BTC" in symbol_str and "USDT" in symbol_str:
+                position_mock.margin = btc_position_value
+                position_mock.size = decimal.Decimal("0.6")  # Position size for BTC
+            elif "ETH" in symbol_str and "USDT" in symbol_str:
+                position_mock.margin = eth_position_value
+                position_mock.size = decimal.Decimal("0.4")  # Position size for ETH
+            else:
+                position_mock.margin = decimal.Decimal("0")
+                position_mock.size = decimal.Decimal("0")
+            position_mock.is_idle.return_value = False
+            position_mock.is_open.return_value = True  # Position is open
+        else:
+            position_mock.get_value.return_value = decimal.Decimal("0")
+            position_mock.size = decimal.Decimal("0")
+            position_mock.is_idle.return_value = True
+            position_mock.is_open.return_value = False
+        return position_mock
+    
+    if is_futures:
+        with mock.patch.object(
+            positions_manager, "get_symbol_position", mock.Mock(side_effect=_get_symbol_position)
+        ) as get_symbol_position_mock, \
+        mock.patch.object(
+            portfolio_value_holder, "get_traded_assets_holdings_value", mock.Mock(return_value=total_portfolio_value)
+        ) as get_traded_assets_holdings_value_mock:
+            assert mode._is_index_config_applied(config_with_valid_distribution, traded_bases) is True
+            assert get_symbol_position_mock.call_count == 2
+            assert "BTC" in str(get_symbol_position_mock.mock_calls[0].args[0])
+            assert "ETH" in str(get_symbol_position_mock.mock_calls[1].args[0])
+            get_symbol_position_mock.reset_mock()
+            assert get_traded_assets_holdings_value_mock.call_count == 2  # called for each coin
+            get_traded_assets_holdings_value_mock.reset_mock()
+    else:
+        with mock.patch.object(
+            portfolio_value_holder,
+            "get_holdings_ratio", mock.Mock(side_effect=lambda coin, **kwargs: {
+                "BTC": decimal.Decimal("0.6"),  # 60% target
+                "ETH": decimal.Decimal("0.4"),  # 40% target
+            }.get(coin, decimal.Decimal("0")))
+        ) as get_holdings_ratio_mock:
+            assert mode._is_index_config_applied(config_with_valid_distribution, traded_bases) is True
+            assert get_holdings_ratio_mock.call_count == 2
+            assert get_holdings_ratio_mock.mock_calls[0].args[0] == "BTC"
+            assert get_holdings_ratio_mock.mock_calls[1].args[0] == "ETH"
+            get_holdings_ratio_mock.reset_mock()
     
     # Test 6: Valid distribution with holdings within tolerance range
     with mock.patch.object(
@@ -2828,8 +4186,9 @@ async def test_is_index_config_applied(tools):
         get_holdings_ratio_mock.reset_mock()
 
 
-async def test_get_config_min_ratio(tools):
-    mode, producer, consumer, trader = await _init_mode(tools, _get_config(tools, {}))
+@pytest.mark.parametrize("trading_tools", ["spot", "futures"], indirect=True)
+async def test_get_config_min_ratio(trading_tools):
+    mode, producer, consumer, trader = await _init_mode(trading_tools, _get_config(trading_tools, {}))
     # 1. With selected profile
     config_with_profiles = {
         index_trading.IndexTradingModeProducer.REBALANCE_TRIGGER_PROFILES: [

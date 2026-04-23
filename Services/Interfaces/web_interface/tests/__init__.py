@@ -18,6 +18,7 @@ import asyncio
 import time
 import mock
 import contextlib
+import random
 
 import octobot_commons.configuration as configuration
 import octobot_commons.singleton as singleton
@@ -44,10 +45,13 @@ import tentacles.Services.Interfaces.web_interface.models as models
 import tentacles.Services.Interfaces.web_interface as web_interface
 
 
-PORT = 5555
 PASSWORD = "123"
 MAX_START_TIME = 5
 NON_AUTH_ROUTES = ["/api/", "robots.txt"]
+
+
+def get_new_port() -> int:
+    return random.randint(5555, 65535)
 
 
 async def _init_bot(distribution: octobot.enums.OctoBotDistribution):
@@ -89,17 +93,19 @@ def _start_web_interface(interface):
 
 # use context manager instead of fixture to prevent pytest threads issues
 @contextlib.asynccontextmanager
-async def get_web_interface(require_password: bool, distribution: octobot.enums.OctoBotDistribution):
+async def get_web_interface(
+    require_password: bool, distribution: octobot.enums.OctoBotDistribution
+):
     web_interface_instance = None
     try:
         with mock.patch.object(configuration_storage.SyncConfigurationStorage, "_save_value_in_config", mock.Mock()):
+            bot = await _init_bot(distribution)
+            interfaces.AbstractInterface.bot_id = bot.bot_id
             web_interface_instance = web_interface.WebInterface({})
-            web_interface_instance.port = PORT
+            web_interface_instance.port = get_new_port()
             web_interface_instance.should_open_web_interface = False
             web_interface_instance.set_requires_password(require_password)
             web_interface_instance.password_hash = configuration.get_password_hash(PASSWORD)
-            bot = await _init_bot(distribution)
-            interfaces.AbstractInterface.bot_api = bot.octobot_api
             first_exchange = next(iter(bot.config[commons_constants.CONFIG_EXCHANGES]))
             with mock.patch.object(web_interface_instance, "_register_on_channels", new=mock.AsyncMock()), \
                  mock.patch.object(models, "get_current_exchange", mock.Mock(return_value=first_exchange)):
@@ -164,13 +170,13 @@ def _force_validate_on_submit(*_):
     return True
 
 
-async def login_user_on_session(session):
+async def login_user_on_session(session, port: int):
     login_data = {
         "password": PASSWORD,
         "remember_me": False
     }
     with mock.patch.object(octobot_authentication.LoginForm, "validate_on_submit", new=_force_validate_on_submit):
-        async with session.post(f"http://localhost:{PORT}/login",
+        async with session.post(f"http://localhost:{port}/login",
                                 data=login_data) as resp:
             assert resp.status == 200
 

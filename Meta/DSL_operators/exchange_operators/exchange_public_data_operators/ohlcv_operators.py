@@ -27,33 +27,27 @@ import octobot_trading.exchanges
 import octobot_trading.exchange_data
 import octobot_trading.api
 import octobot_trading.constants
+import octobot_trading.dsl
 
 import tentacles.Meta.DSL_operators.exchange_operators.exchange_operator as exchange_operator
 
 
 @dataclasses.dataclass
-class ExchangeDataDependency(dsl_interpreter.InterpreterDependency):
-    exchange_manager_id: str
-    symbol: typing.Optional[str]
-    time_frame: typing.Optional[str]
+class ExchangeDataDependency(octobot_trading.dsl.SymbolDependency):
     data_source: str = octobot_trading.constants.OHLCV_CHANNEL
 
     def __hash__(self) -> int:
-        return hash((self.exchange_manager_id, self.symbol, self.time_frame, self.data_source))
+        return hash((self.symbol, self.time_frame, self.data_source))
 
 
 class OHLCVOperator(exchange_operator.ExchangeOperator):
-    def __init__(self, *parameters: dsl_interpreter.OperatorParameterType, **kwargs: typing.Any):
-        super().__init__(*parameters, **kwargs)
-        self.value: dsl_interpreter_operator.ComputedOperatorParameterType = exchange_operator.UNINITIALIZED_VALUE # type: ignore
-
     @staticmethod
     def get_library() -> str:
         # this is a contextual operator, so it should not be included by default in the get_all_operators function return values
         return octobot_commons.constants.CONTEXTUAL_OPERATORS_LIBRARY
 
-    @staticmethod
-    def get_parameters() -> list[dsl_interpreter.OperatorParameter]:
+    @classmethod
+    def get_parameters(cls) -> list[dsl_interpreter.OperatorParameter]:
         return [
             dsl_interpreter.OperatorParameter(name="symbol", description="the symbol to get the OHLCV data for", required=False, type=str),
             dsl_interpreter.OperatorParameter(name="time_frame", description="the time frame to get the OHLCV data for", required=False, type=str),
@@ -69,12 +63,6 @@ class OHLCVOperator(exchange_operator.ExchangeOperator):
             )
         return None, None
 
-    def compute(self) -> dsl_interpreter.ComputedOperatorParameterType:
-        if self.value is exchange_operator.UNINITIALIZED_VALUE:
-            raise octobot_commons.errors.DSLInterpreterError("{self.__class__.__name__} has not been initialized")
-        return self.value
-
-
 def create_ohlcv_operators(
     exchange_manager: typing.Optional[octobot_trading.exchanges.ExchangeManager],
     symbol: typing.Optional[str],
@@ -84,13 +72,14 @@ def create_ohlcv_operators(
     ] = None
 ) -> typing.List[type[OHLCVOperator]]:
 
-    if exchange_manager is None and candle_manager_by_time_frame_by_symbol is None:
-        raise octobot_commons.errors.InvalidParametersError("exchange_manager or candle_manager_by_time_frame_by_symbol must be provided")
-
     def _get_candles_values_with_latest_kline_if_available(
         input_symbol: typing.Optional[str], input_time_frame: typing.Optional[str],
         value_type: commons_enums.PriceIndexes, limit: int = -1
     ) -> np.ndarray:
+        if exchange_manager is None and candle_manager_by_time_frame_by_symbol is None:
+            raise octobot_commons.errors.DSLInterpreterError(
+                "exchange_manager or candle_manager_by_time_frame_by_symbol must be provided"
+            )
         _symbol = input_symbol or symbol
         _time_frame = input_time_frame or time_frame
         if exchange_manager is None:
@@ -125,20 +114,28 @@ def create_ohlcv_operators(
                     )
         return candles_values
 
-    def _get_dependencies() -> typing.List[ExchangeDataDependency]:
+    def _static_get_dependencies() -> typing.List[ExchangeDataDependency]:
         return [
             ExchangeDataDependency(
-                exchange_manager_id=octobot_trading.api.get_exchange_manager_id(exchange_manager),
                 symbol=symbol,
-                time_frame=time_frame
+                time_frame=time_frame,
             )
-        ]
+        ] if symbol else []
 
     class _LocalOHLCVOperator(OHLCVOperator):
         PRICE_INDEX: commons_enums.PriceIndexes = None # type: ignore
 
         def get_dependencies(self) -> typing.List[dsl_interpreter.InterpreterDependency]:
-            return super().get_dependencies() + _get_dependencies()
+            local_dependencies = _static_get_dependencies()
+            param_by_name = self.get_input_value_by_parameter()
+            if symbol := param_by_name.get("symbol"):
+                symbol_dep = ExchangeDataDependency(
+                    symbol=symbol,
+                    time_frame=param_by_name.get("time_frame"),
+                )
+                if symbol_dep not in local_dependencies:
+                    local_dependencies.append(symbol_dep)
+            return super().get_dependencies() + local_dependencies
 
         async def pre_compute(self) -> None:
             await super().pre_compute()

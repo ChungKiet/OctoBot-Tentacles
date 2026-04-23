@@ -21,7 +21,7 @@ import octobot_commons.constants as commons_constants
 
 import octobot_trading.api
 import octobot_trading.exchanges.connectors.ccxt.ccxt_clients_cache as ccxt_clients_cache
-import octobot_trading.util.test_tools.exchange_data as exchange_data_import
+import octobot_trading.exchanges.util.exchange_data as exchange_data_import
 
 import tentacles.Meta.Keywords.scripting_library as scripting_library
 import tentacles.Trading.Mode.index_trading_mode.index_distribution as index_distribution
@@ -76,12 +76,12 @@ async def test_collect_candles_without_backend_and_run_backtesting(trading_mode_
     )
 
     # 2. collect candles
-    ccxt_clients_cache._MARKETS_BY_EXCHANGE.clear()
+    ccxt_clients_cache._SHARED_MARKETS_EXCHANGE_BY_EXCHANGE.clear()
     await scripting_library.init_exchange_market_status_and_populate_backtesting_exchange_data(
         exchange_data, profile_data
     )
     # cached markets have been updated and now contain this exchange markets
-    assert len(ccxt_clients_cache._MARKETS_BY_EXCHANGE) == 1
+    assert len(ccxt_clients_cache._SHARED_MARKETS_EXCHANGE_BY_EXCHANGE) == 1
     # ensure collected datas are correct
     assert len(exchange_data.markets) == 2
     assert sorted([market.symbol for market in exchange_data.markets]) == ["BTC/USDT", "ETH/USDT"]

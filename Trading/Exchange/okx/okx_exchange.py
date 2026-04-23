@@ -208,7 +208,7 @@ class Okx(exchanges.RestExchange):
     async def get_account_id(self, **kwargs: dict) -> str:
         accounts = await self.connector.client.fetch_accounts()
         try:
-            with self.connector.error_describer():
+            with self.connector.error_describer(True):
                 return accounts[0]["id"]
         except IndexError as err:
             # should never happen as at least one account should be available
@@ -364,18 +364,18 @@ class Okx(exchanges.RestExchange):
                                           reduce_only=reduce_only, params=params)
 
     def _get_ccxt_margin_type(self, symbol, contract=None):
-        if not self.exchange_manager.exchange.has_pair_future_contract(symbol):
+        if not self.exchange_manager.exchange.has_pair_contract(symbol):
             raise KeyError(f"{symbol} contract unavailable")
-        contract = contract or self.exchange_manager.exchange.get_pair_future_contract(symbol)
+        contract = contract or self.exchange_manager.exchange.get_pair_contract(symbol)
         return ccxt_enums.ExchangeMarginTypes.ISOLATED.value if contract.is_isolated() \
             else ccxt_enums.ExchangeMarginTypes.CROSS.value
 
     def _get_margin_query_params(self, symbol, **kwargs):
         pos_side = self.connector.adapter.OKX_ONE_WAY_MODE
-        if not self.exchange_manager.exchange.has_pair_future_contract(symbol):
+        if not self.exchange_manager.exchange.has_pair_contract(symbol):
             raise KeyError(f"{symbol} contract unavailable")
         else:
-            contract = self.exchange_manager.exchange.get_pair_future_contract(symbol)
+            contract = self.exchange_manager.exchange.get_pair_contract(symbol)
             if not contract.is_one_way_position_mode():
                 self.logger.debug(f"Switching {symbol} position mode to one way")
                 contract.set_position_mode(is_one_way=True, is_hedge=False)

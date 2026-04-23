@@ -56,6 +56,7 @@ class GPTEvaluator(evaluators.TAEvaluator):
     }
     SOURCES = ["Open", "High", "Low", "Close", "Volume", "Full candle (For no indicator only)"]
     ALLOW_GPT_REEVALUATION_ENV = "ALLOW_GPT_REEVALUATIONS"
+    SAME_MODEL_AS_SERVICE = "use interface configured model"
     GPT_MODELS = []
     ALLOW_TOKEN_LIMIT_UPDATE = False
 
@@ -100,7 +101,7 @@ class GPTEvaluator(evaluators.TAEvaluator):
         :return: the filled user input configuration
         """
         self.is_backtesting = self._is_in_backtesting()
-        if self.is_backtesting and not _get_gpt_service().BACKTESTING_ENABLED:
+        if self.is_backtesting and not services_api.is_service_used_by_backtestable_feed(_get_gpt_service()):
             self.logger.error(f"{self.get_name()} is disabled in backtesting. It will only emit neutral evaluations")
         await self._init_GPT_models()
         return await super().load_and_save_user_inputs(bot_id)
@@ -128,11 +129,11 @@ class GPTEvaluator(evaluators.TAEvaluator):
         )
         if self.enable_model_selector:
             current_value = self.specific_config.get("GPT_model")
-            models = list(self.GPT_MODELS) or (
+            models = (list(self.GPT_MODELS) or (
                 [current_value] if current_value else [_get_gpt_service().DEFAULT_MODEL]
-            )
+            )) + [self.SAME_MODEL_AS_SERVICE]
             self.gpt_model = self.UI.user_input(
-                "GPT model", enums.UserInputTypes.OPTIONS, _get_gpt_service().DEFAULT_MODEL,
+                "GPT model", enums.UserInputTypes.OPTIONS, self.SAME_MODEL_AS_SERVICE,
                 inputs, options=sorted(models),
                 title="GPT Model: the GPT model to use. Enable the evaluator to load other models."
             )
@@ -238,7 +239,13 @@ class GPTEvaluator(evaluators.TAEvaluator):
                 {} if self.is_backtesting else self.services_config
             )
             service.apply_daily_token_limit_if_possible(self.gpt_tokens_limit)
-            model = self.gpt_model if self.enable_model_selector else None
+            model = (
+                self.gpt_model 
+                if (
+                    self.enable_model_selector
+                    and self.gpt_model != self.SAME_MODEL_AS_SERVICE
+                 ) else None
+            )
             resp = await service.get_chat_completion(
                 [
                     service.create_message("system", preprompt, model=model),

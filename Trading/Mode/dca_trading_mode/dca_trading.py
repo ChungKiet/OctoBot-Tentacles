@@ -223,10 +223,13 @@ class DCATradingModeConsumer(trading_modes.AbstractTradingModeConsumer):
                 raise trading_errors.OrderCreationError()
             raise trading_errors.MissingMinimalExchangeTradeVolume()
 
-        except (trading_errors.MissingFunds,
-                trading_errors.MissingMinimalExchangeTradeVolume,
-                trading_errors.OrderCreationError,
-                trading_errors.InvalidCancelPolicyError):
+        except (
+            trading_errors.MissingFunds,
+            trading_errors.MissingMinimalExchangeTradeVolume,
+            trading_errors.OrderCreationError,
+            trading_errors.InvalidCancelPolicyError,
+            trading_errors.TraderDisabledError
+        ):
             raise
         except Exception as err:
             self.logger.exception(
@@ -613,6 +616,7 @@ class DCATradingModeProducer(trading_modes.AbstractTradingModeProducer):
             return self.trading_mode.are_initialization_orders_pending
         return False
 
+    @trading_modes.enabled_trader_only()
     async def trigger_dca(self, cryptocurrency: str, symbol: str, state: trading_enums.EvaluatorStates):
         if self.trading_mode.max_asset_holding_ratio < trading_constants.ONE:
             # if holding ratio should be checked, wait for price init to be able to compute this ratio
@@ -642,7 +646,7 @@ class DCATradingModeProducer(trading_modes.AbstractTradingModeProducer):
                 )
                 if config_leverage:
                     parsed_leverage = decimal.Decimal(str(config_leverage))
-                    current_leverage = self.exchange_manager.exchange.get_pair_future_contract(symbol).current_leverage
+                    current_leverage = self.exchange_manager.exchange.get_pair_contract(symbol).current_leverage
                     if parsed_leverage != current_leverage:
                         self.logger.info(f"Updating leverage of {symbol} from {current_leverage} to {parsed_leverage}")
                         await self.trading_mode.set_leverage(symbol, side, parsed_leverage)

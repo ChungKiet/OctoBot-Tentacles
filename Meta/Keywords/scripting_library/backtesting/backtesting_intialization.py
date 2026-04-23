@@ -32,7 +32,7 @@ import octobot_tentacles_manager.configuration
 import octobot.backtesting.independent_backtesting
 import octobot.backtesting.minimal_data_importer as minimal_data_importer
 
-import octobot_trading.util.test_tools.exchange_data as exchange_data_import
+import octobot_trading.exchanges.util.exchange_data as exchange_data_import
 import octobot_trading.api
 
 import tentacles.Meta.Keywords.scripting_library as scripting_library
@@ -92,6 +92,7 @@ def _init_independent_backtesting(
     profile_data: commons_profiles.ProfileData,
     backtest_data: octobot_backtesting.backtest_data.BacktestData,
     enable_logs: bool = False,
+    services_config: typing.Optional[dict] = None,
 ) -> "octobot.backtesting.independent_backtesting.IndependentBacktesting":
     independent_backtesting = octobot.backtesting.independent_backtesting.IndependentBacktesting(
         backtest_data.config,
@@ -110,7 +111,7 @@ def _init_independent_backtesting(
             tentacle.name: tentacle.config
             for tentacle in profile_data.tentacles
         },
-        services_config={},
+        services_config=services_config or {},
     )
     independent_backtesting.symbols_to_create_exchange_classes.update({
         exchange: [

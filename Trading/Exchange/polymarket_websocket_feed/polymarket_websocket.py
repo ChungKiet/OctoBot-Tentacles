@@ -22,8 +22,9 @@ class PolymarketWebsocketConnector(exchanges.CCXTWebsocketConnector):
     EXCHANGE_FEEDS = {
         Feeds.TRADES: True,
         Feeds.KLINE: Feeds.UNSUPPORTED.value,
-        Feeds.TICKER: Feeds.UNSUPPORTED.value,
+        Feeds.TICKER: True,
         Feeds.CANDLE: Feeds.UNSUPPORTED.value,
+        # Feeds.MARKETS: True,
     }
 
     @classmethod

@@ -207,7 +207,7 @@ class CoinbaseConnector(ccxt_connector.CCXTConnector):
         """
         if not kwargs:
             kwargs = {}
-        with self.error_describer():
+        with self.error_describer(True):
             results = await self._paginated_request(self.client.fetch_balance, params=kwargs)
             merged_balances = {}
             for result in results:
@@ -279,7 +279,6 @@ class CoinbaseConnector(ccxt_connector.CCXTConnector):
 
 class Coinbase(exchanges.RestExchange):
     MAX_PAGINATION_LIMIT: int = 300
-    ALWAYS_REQUIRES_AUTHENTICATION = True
     IS_SKIPPING_EMPTY_CANDLES_IN_OHLCV_FETCH = True
     DEFAULT_CONNECTOR_CLASS = CoinbaseConnector
 
@@ -390,7 +389,7 @@ class Coinbase(exchanges.RestExchange):
 
     async def get_account_id(self, **kwargs: dict) -> str:
         try:
-            with self.connector.error_describer():
+            with self.connector.error_describer(True):
                 accounts = await self.connector.client.fetch_accounts()
                 # use portfolio id when possible to enable "coinbase subaccounts" which are called "portfolios"
                 # note: oldest portfolio portfolio id == user id (from previous v2PrivateGetUser) when

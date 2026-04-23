@@ -29,6 +29,9 @@ class LBankCCXTWebsocketConnector(exchanges.CCXTWebsocketConnector, lbank_exchan
         Feeds.CANDLE: True,
     }
     FIX_CANDLES_TIMEZONE_IF_NEEDED: bool = True
+    # A http proxy can enable other traded pairs with can't be watched from ws
+    # of no proxy is provided
+    REQUIRES_PROXY_IF_REST_PROXY_ENABLED: bool = True
 
     def __init__(self, *args, **kwargs):
         exchanges.CCXTWebsocketConnector.__init__(self, *args, **kwargs)
@@ -37,6 +40,7 @@ class LBankCCXTWebsocketConnector(exchanges.CCXTWebsocketConnector, lbank_exchan
     def _create_client(self):
         exchanges.CCXTWebsocketConnector._create_client(self)
         self.client.sign = self._lazy_maybe_force_signed_requests(self.client.sign)
+        self.client.fetch_swap_markets = self.fetch_swap_markets_mock
 
     def _should_authenticate(self):
         return exchanges.CCXTWebsocketConnector._should_authenticate(self) or (

@@ -169,6 +169,8 @@ class RemoteTradingSignalsModeConsumer(trading_modes.AbstractTradingModeConsumer
             await self.handle_signal(symbol, data)
         except errors.MissingMinimalExchangeTradeVolume:
             self.logger.info(self.get_minimal_funds_error(symbol, final_note))
+        except errors.TraderDisabledError as err:
+            self.logger.error(f"Impossible to execution action on a disabled trader: {err}.")
         except Exception as e:
             self.logger.exception(e, True, f"Error when handling remote signal orders: {e}")
 
@@ -487,7 +489,7 @@ class RemoteTradingSignalsModeConsumer(trading_modes.AbstractTradingModeConsumer
         }
         fees_currency_side = None
         if self.exchange_manager.is_future:
-            fees_currency_side = self.exchange_manager.exchange.get_pair_future_contract(symbol)\
+            fees_currency_side = self.exchange_manager.exchange.get_pair_contract(symbol)\
                 .get_fees_currency_side()
         for order_description in orders_descriptions:
             if group_id := order_description[trading_enums.TradingSignalOrdersAttrs.GROUP_ID.value]:
@@ -674,6 +676,7 @@ class RemoteTradingSignalsModeProducer(trading_modes.AbstractTradingModeProducer
         # trading mode is waking up this producer directly from signal channel
         return []
 
+    @trading_modes.enabled_trader_only()
     async def signal_callback(self, signal):
         exchange_type = signal.content[trading_enums.TradingSignalOrdersAttrs.EXCHANGE_TYPE.value]
         if exchange_type == exchanges.get_exchange_type(self.exchange_manager).value:
