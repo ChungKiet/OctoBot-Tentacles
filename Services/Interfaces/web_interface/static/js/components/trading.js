@@ -276,12 +276,7 @@ const ordersNotificationCallback = (title, _) => {
     }
 }
 
-function debouncedReloadDisplay(){
-    debounce(
-        () => reloadDisplay(true),
-        500
-    );
-}
+const debouncedReloadDisplay = debounce(() => reloadDisplay(true), 500);
 
 const reloadDisplay = async (update) => {
     if(!update){

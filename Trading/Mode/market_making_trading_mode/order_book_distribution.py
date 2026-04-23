@@ -91,11 +91,13 @@ class OrderBookDistribution:
         asks_count: int,
         min_spread: decimal.Decimal,
         max_spread: decimal.Decimal,
+        order_quote_amount: typing.Optional[decimal.Decimal] = None,
     ):
         self.min_spread: decimal.Decimal = min_spread
         self.max_spread: decimal.Decimal = max_spread
         self.bids_count: int = bids_count
         self.asks_count: int = asks_count
+        self.order_quote_amount: typing.Optional[decimal.Decimal] = order_quote_amount
 
         self.bids: list[BookOrderData] = []
         self.asks: list[BookOrderData] = []
@@ -383,17 +385,30 @@ class OrderBookDistribution:
         # order prices are sorted from the inside out of the order book (closest to the price first)
         order_prices = self._get_order_prices(start_price, end_price, orders_count)
 
-        total_volume = self._get_total_volume_to_use(
-            side, reference_price, reference_volume, order_prices, available_funds, False
-        )
-        # order volumes are sorted from the inside out of the order book (closest to the price first)
-        order_volumes = self._get_order_volumes(side, total_volume, order_prices)
-        if side is trading_enums.TradeOrderSide.BUY:
-            # convert quote volume into base
-            order_volumes = [
-                (volume / order_price) if order_price else volume
-                for volume, order_price in zip(order_volumes, order_prices)
-            ]
+        if self.order_quote_amount is not None:
+            # fixed amount per order: each order is worth exactly order_quote_amount in quote currency
+            if side is trading_enums.TradeOrderSide.BUY:
+                order_volumes = [
+                    (self.order_quote_amount / order_price) if order_price else self.order_quote_amount
+                    for order_price in order_prices
+                ]
+            else:
+                order_volumes = [
+                    (self.order_quote_amount / reference_price) if reference_price else self.order_quote_amount
+                    for _ in order_prices
+                ]
+        else:
+            total_volume = self._get_total_volume_to_use(
+                side, reference_price, reference_volume, order_prices, available_funds, False
+            )
+            # order volumes are sorted from the inside out of the order book (closest to the price first)
+            order_volumes = self._get_order_volumes(side, total_volume, order_prices)
+            if side is trading_enums.TradeOrderSide.BUY:
+                # convert quote volume into base
+                order_volumes = [
+                    (volume / order_price) if order_price else volume
+                    for volume, order_price in zip(order_volumes, order_prices)
+                ]
 
         if len(order_prices) != len(order_volumes):
             raise ValueError(f"order_prices and order_volumes should have the same size")
@@ -741,6 +756,13 @@ class OrderBookDistribution:
         until_depth_threshold_only: bool,
         daily_trading_volume_percent=DAILY_TRADING_VOLUME_PERCENT
     ) -> decimal.Decimal:
+        if self.order_quote_amount is not None:
+            orders_count = decimal.Decimal(str(
+                self.bids_count if side == trading_enums.TradeOrderSide.BUY else self.asks_count
+            ))
+            if side == trading_enums.TradeOrderSide.BUY:
+                return self.order_quote_amount * orders_count
+            return (self.order_quote_amount / reference_price * orders_count) if reference_price else trading_constants.ZERO
         # ideal volume contains daily_trading_volume_percent of daily_volume
         # within the first target_cumulated_volume_percent of the order book
         target_before_threshold_volume = (

@@ -104,6 +104,8 @@ class MarketMakingTradingMode(trading_modes.AbstractTradingMode):
     BIDS_COUNT = "bids_count"
     ASKS_COUNT = "asks_count"
     REFERENCE_EXCHANGE = "reference_exchange"
+    MIN_REFRESH_INTERVAL = "min_refresh_interval_seconds"
+    ORDER_QUOTE_AMOUNT = "order_quote_amount"
     LOCAL_EXCHANGE_PRICE = "local"
 
     MIN_SPREAD_DESC = "Min spread %: Percentage of the current price to use as bid-ask spread."
@@ -114,6 +116,15 @@ class MarketMakingTradingMode(trading_modes.AbstractTradingMode):
         f"Reference exchange. Used as the price source to create the order book's orders from. "
         f"This exchange need to have a trading market for the selected traded pair. Example: \"binance\". "
         f"Use \"{LOCAL_EXCHANGE_PRICE}\" to use the current exchange price."
+    )
+    MIN_REFRESH_INTERVAL_DESC = (
+        "Min refresh interval (seconds): Minimum time between order book refreshes triggered by price changes. "
+        "Set to 0 to refresh on every price update. Order fills always trigger an immediate refresh regardless."
+    )
+    ORDER_QUOTE_AMOUNT_DESC = (
+        "Order quote amount: Fixed size of each order in quote currency (e.g. 500 = 500 USDT per order). "
+        "When set, all orders on both sides will be exactly this size. "
+        "Set to 0 to use daily_volume_percent instead."
     )
 
     def init_user_inputs(self, inputs: dict) -> None:
@@ -146,6 +157,14 @@ class MarketMakingTradingMode(trading_modes.AbstractTradingMode):
             "binance", inputs,
             other_schema_values={"inputAttributes": {"placeholder": "binance"}},
             title=self.REFERENCE_EXCHANGE_DESC
+        )
+        self.UI.user_input(
+            self.MIN_REFRESH_INTERVAL, commons_enums.UserInputTypes.FLOAT, 0, inputs,
+            min_val=0, title=self.MIN_REFRESH_INTERVAL_DESC,
+        )
+        self.UI.user_input(
+            self.ORDER_QUOTE_AMOUNT, commons_enums.UserInputTypes.FLOAT, 100, inputs,
+            min_val=0, title=self.ORDER_QUOTE_AMOUNT_DESC,
         )
 
     def get_current_state(self) -> (str, float):
@@ -256,8 +275,10 @@ class MarketMakingTradingMode(trading_modes.AbstractTradingMode):
             max_spread = decimal.Decimal(str(pair_config[cls.MAX_SPREAD] / 100))
             bids_count = int(pair_config[cls.BIDS_COUNT])
             asks_count = int(pair_config[cls.ASKS_COUNT])
+            raw_quote_amount = pair_config.get(cls.ORDER_QUOTE_AMOUNT, 100)
+            order_quote_amount = decimal.Decimal(str(raw_quote_amount)) if raw_quote_amount else None
             return order_book_distribution.OrderBookDistribution(
-                bids_count, asks_count, min_spread, max_spread,
+                bids_count, asks_count, min_spread, max_spread, order_quote_amount=order_quote_amount,
             )
         except TypeError as err:
             raise ValueError(f"Invalid config value: {err}") from err
@@ -488,6 +509,8 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
         self.order_book_distribution: order_book_distribution.OrderBookDistribution = None
         self.reference_price = reference_price_import.PriceSource
         self.replace_whole_book_distance_threshold: float = 0.5
+        self.min_refresh_interval_seconds: float = 0
+        self._last_price_refresh_at: float = 0
 
         self.symbol_trading_config: dict = None
         self.healthy = False
@@ -523,6 +546,9 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
         self.reference_price = reference_price_import.PriceSource(
             self.symbol_trading_config[self.trading_mode.REFERENCE_EXCHANGE],
             self.symbol
+        )
+        self.min_refresh_interval_seconds = float(
+            self.symbol_trading_config.get(self.trading_mode.MIN_REFRESH_INTERVAL, 0)
         )
         if len(self.exchange_manager.exchange_config.traded_symbols) > 1:
             error = (
@@ -1302,10 +1328,15 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
         return trigger
 
     async def _on_reference_price_update(self):
+        if self.min_refresh_interval_seconds > 0:
+            now = self.exchange_manager.exchange.get_exchange_current_time()
+            if now - self._last_price_refresh_at < self.min_refresh_interval_seconds:
+                return
         trigger = False
         if reference_price := await self._get_reference_price():
             trigger = await self.on_new_reference_price(reference_price)
         if trigger:
+            self._last_price_refresh_at = self.exchange_manager.exchange.get_exchange_current_time()
             await self._ensure_market_making_orders(f"reference price update: {float(reference_price)}")
 
     async def order_filled_callback(self, order: dict):
