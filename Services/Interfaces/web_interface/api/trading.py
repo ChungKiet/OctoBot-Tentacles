@@ -78,7 +78,33 @@ def register(blueprint):
     @blueprint.route("/currency_list", methods=['GET'])
     @login.login_required_when_activated
     def currency_list():
-        return flask.jsonify(models.get_all_symbols_list())
+        import octobot_trading.api as trading_api
+        all_currencies = models.get_all_symbols_list()
+        by_symbol = {}
+        for entry in all_currencies:
+            sym = entry.get('s', '').upper()
+            if sym and sym not in by_symbol:
+                by_symbol[sym] = entry
+        try:
+            exchange_ids = trading_api.get_exchange_ids()
+            exchange_managers = trading_api.get_exchange_managers_from_exchange_ids(exchange_ids)
+            exchange_bases = set()
+            for em in exchange_managers:
+                if not trading_api.get_is_backtesting(em):
+                    for pair in trading_api.get_all_exchange_symbols(em):
+                        if '/' in pair:
+                            exchange_bases.add(pair.split('/')[0].upper())
+        except Exception:
+            exchange_bases = set()
+        pinned_ids = set()
+        pinned = []
+        for base in sorted(exchange_bases):
+            entry = by_symbol.get(base)
+            if entry and entry['i'] not in pinned_ids:
+                pinned_ids.add(entry['i'])
+                pinned.append(entry)
+        remaining = [e for e in all_currencies if e['i'] not in pinned_ids]
+        return flask.jsonify(pinned + remaining)
 
 
     @blueprint.route("/historical_portfolio_value", methods=['GET'])

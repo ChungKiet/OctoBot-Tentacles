@@ -1243,6 +1243,8 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
             base_vol = decimal.Decimal(str(ticker.get("baseVolume") or 0))
             quote_vol = decimal.Decimal(str(ticker.get("quoteVolume") or 0))
             if base_vol and not base_vol.is_nan() and base_vol > 0:
+                if not quote_vol or quote_vol.is_nan() or quote_vol <= 0:
+                    quote_vol = base_vol * reference_price
                 return base_vol, quote_vol
         except Exception:
             pass
