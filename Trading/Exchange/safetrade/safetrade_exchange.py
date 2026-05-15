@@ -349,8 +349,11 @@ class SafetradeClient:
             'future': False,
             'option': False,
             'precision': {
-                'amount': raw.get('amount_precision', 8),
-                'price': raw.get('price_precision', 8),
+                'amount': (
+                    min(int(raw.get('amount_precision')), 8)
+                    if raw.get('amount_precision') is not None else 8
+                ),
+                'price': min(int(raw.get('price_precision') or 8), 8),
             },
             'limits': {
                 'amount': {'min': min_amount, 'max': max_amount},
@@ -417,8 +420,8 @@ class SafetradeClient:
             'change': change,
             'percentage': pct,
             'average': self.parse_number(raw.get('avg_price')),
-            'baseVolume': self.parse_number(raw.get('amount') or raw.get('volume')),
-            'quoteVolume': self.parse_number(raw.get('vol')),
+            'baseVolume': self.parse_number_or_zero(raw.get('amount')),
+            'quoteVolume': self.parse_number_or_zero(raw.get('volume')),
             'info': raw,
         }
 
@@ -887,7 +890,7 @@ class safetrade(exchanges.RestExchange):
 
     HAS_FETCHED_DETAILS = True
 
-    FIX_MARKET_STATUS = True
+    FIX_MARKET_STATUS = False
     REQUIRE_ORDER_FEES_FROM_TRADES = True
     SUPPORT_FETCHING_CANCELLED_ORDERS = False
     IS_SKIPPING_EMPTY_CANDLES_IN_OHLCV_FETCH = True

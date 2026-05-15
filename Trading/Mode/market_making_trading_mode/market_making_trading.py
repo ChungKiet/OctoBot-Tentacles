@@ -685,6 +685,10 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
                             f"Impossible to start {self.symbol} market making "
                             f"on {self.exchange_manager.exchange_name}: {err}"
                         )
+                        return True
+                    # If missing volume at first execution: return False so a retry is scheduled
+                    if self.is_first_execution:
+                        return False
                     return True
         return False
 
@@ -1248,6 +1252,14 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
                 return base_vol, quote_vol
         except Exception:
             pass
+        raw_quote_amount = self.symbol_trading_config.get(self.trading_mode.ORDER_QUOTE_AMOUNT, 0)
+        if raw_quote_amount and reference_price:
+            order_quote = decimal.Decimal(str(raw_quote_amount))
+            bids_count = int(self.symbol_trading_config.get(self.trading_mode.BIDS_COUNT, 5))
+            asks_count = int(self.symbol_trading_config.get(self.trading_mode.ASKS_COUNT, 5))
+            quote_vol = order_quote * (bids_count + asks_count) * 2
+            base_vol = quote_vol / reference_price
+            return base_vol, quote_vol
         raise ValueError(
             f"Missing volume for {self.symbol} on {self.exchange_manager.exchange_name}. "
             f"{reference_price=}"
