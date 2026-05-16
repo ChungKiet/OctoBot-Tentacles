@@ -92,6 +92,11 @@ class SafetradeClient:
         self._ws_connected: bool = False
         self._ws_reconnect_delay: float = 5.0  # grows on repeated failures
 
+        # Private WebSocket — real-time order/trade fill notifications
+        self._ws_private_task: typing.Optional[asyncio.Task] = None
+        self._ws_filled_orders: dict = {}           # exchange_id → parsed order (WS fill cache)
+        self._on_order_update: typing.Optional[typing.Callable] = None  # set by connector
+
     # ------------------------------------------------------------------
     # CCXT shim attributes
     # ------------------------------------------------------------------
@@ -594,6 +599,9 @@ class SafetradeClient:
         return [self._parse_order(o) for o in (raw or [])]
 
     async def fetch_order(self, id: str, symbol: str = None, params: dict = None) -> dict:
+        cached = self._ws_filled_orders.pop(str(id), None)
+        if cached is not None:
+            return cached
         raw = await self._get(f'/trade/market/orders/{id}', authenticated=True)
         return self._parse_order(raw)
 
@@ -809,12 +817,137 @@ class SafetradeClient:
         return None
 
     # ------------------------------------------------------------------
+    # Private WebSocket — real-time order / trade fill events
+    # ------------------------------------------------------------------
+
+    def _ws_private_url(self) -> str:
+        base = self.base_url.replace('https://', 'wss://').replace('http://', 'ws://')
+        base = base.rstrip('/')
+        if base.endswith('/api/v2'):
+            base = base[:-len('/api/v2')]
+        return base + '/api/v2/websocket/private'
+
+    def _ws_private_ensure_started(self):
+        if not self.api_key or not self.api_secret:
+            return
+        if self._ws_private_task is None or self._ws_private_task.done():
+            try:
+                loop = asyncio.get_running_loop()
+                self._ws_private_task = loop.create_task(self._ws_private_loop())
+            except RuntimeError:
+                pass
+
+    async def _ws_private_loop(self):
+        """Persistent private WS loop: authenticates with HMAC and subscribes to order/trade events.
+
+        Requires the API key to have the 'websocket' scope in the Zsmartex admin panel.
+        If the endpoint returns HTTP 403/404, the loop gives up (REST polling covers fills).
+        """
+        import json as _json
+        import logging
+        _log = logging.getLogger('SafetradeConnector')
+        reconnect_delay = 5.0
+
+        while True:
+            try:
+                from curl_cffi.requests import AsyncSession as _CffiSession
+                url = self._ws_private_url()
+                nonce = str(int(time.time() * 1000))
+                h = hmac.new(self.api_secret.encode('utf-8'), digestmod=hashlib.sha256)
+                h.update((nonce + self.api_key).encode('utf-8'))
+                sig = binascii.hexlify(h.digest()).decode()
+                ws_auth_headers = {
+                    'X-Auth-Apikey': self.api_key,
+                    'X-Auth-Nonce': nonce,
+                    'X-Auth-Signature': sig,
+                    'User-Agent': self._USER_AGENT,
+                }
+                async with _CffiSession(impersonate='chrome124') as _sess:
+                    async with _sess.ws_connect(url, headers=ws_auth_headers) as ws:
+                        reconnect_delay = 5.0
+                        _log.info(f"[Safetrade] Private WS connected to {url}, subscribing to order/trade events")
+                        await ws.send_str(_json.dumps({
+                            "event": "subscribe",
+                            "streams": ["order", "trade"],
+                        }))
+                        while True:
+                            try:
+                                raw, _ = await asyncio.wait_for(ws.recv(), timeout=30)
+                                data = _json.loads(raw)
+                                self._ws_handle_private(data)
+                            except asyncio.TimeoutError:
+                                await ws.send_str(_json.dumps({"event": "ping"}))
+            except Exception as e:
+                err_str = str(e)
+                if '403' in err_str or '404' in err_str:
+                    _log.warning(
+                        f"[Safetrade] Private WS unavailable ({err_str[:60]}). "
+                        f"Grant API key '{self.api_key}' the 'websocket' scope in the "
+                        f"Zsmartex admin panel to enable real-time fill notifications. "
+                        f"Falling back to REST polling (≤7s latency)."
+                    )
+                    return  # stop retrying — REST polling handles fills
+                _log.warning(
+                    f"[Safetrade] Private WS error: {type(e).__name__}: {err_str[:80]}"
+                    f" — reconnecting in {reconnect_delay:.0f}s"
+                )
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 120.0)
+
+    def _ws_handle_private(self, data: dict):
+        """Parse private WS events and fire the order-update callback for fills/cancels.
+
+        Handles OpenDAX /api/v2/trade/stream format:
+          {"order": {...}}                         — order update
+          {"trade": {...}}                         — trade (fill confirmation)
+          {"event": "order", "result": {...}}      — alternate envelope
+          {"event": "subscribe", "streams": [...]} — subscription ack (ignore)
+        """
+        import logging
+        _log = logging.getLogger('SafetradeConnector')
+
+        event = data.get('event', '')
+        if event in ('ping', 'pong', 'subscribe', 'subscriptions', 'authenticated', 'error', ''):
+            if event not in ('', 'ping'):
+                return
+
+        # Extract order payload from various envelope styles
+        order_data = (
+            data.get('order')
+            or (data.get('result') if 'order' in event else None)
+            or (data.get('data') if 'order' in event else None)
+        )
+
+        if not isinstance(order_data, dict):
+            return
+
+        state = order_data.get('state', '')
+        exchange_id = str(order_data.get('id', ''))
+        if not exchange_id or state not in ('done', 'cancel'):
+            return
+
+        parsed = self._parse_order(order_data)
+        _log.info(
+            f"[Safetrade] Private WS: order {exchange_id} → {parsed.get('status')} "
+            f"({parsed.get('symbol')}, filled={parsed.get('filled')})"
+        )
+        self._ws_filled_orders[exchange_id] = parsed
+
+        if self._on_order_update is not None:
+            try:
+                self._on_order_update(exchange_id, parsed)
+            except Exception as ex:
+                _log.debug(f"[Safetrade] _on_order_update callback error: {ex}")
+
+    # ------------------------------------------------------------------
     # Session management
     # ------------------------------------------------------------------
 
     async def close(self):
         if self._ws_task and not self._ws_task.done():
             self._ws_task.cancel()
+        if self._ws_private_task and not self._ws_private_task.done():
+            self._ws_private_task.cancel()
         if self._client and not self._client.is_closed:
             await self._client.aclose()
             self._client = None
@@ -863,6 +996,28 @@ class SafetradeConnector(exchanges.CCXTConnector):
 
     async def initialize_impl(self):
         await super().initialize_impl()
+        self.client._on_order_update = self._schedule_ws_order_update
+        self.client._ws_private_ensure_started()
+
+    def _schedule_ws_order_update(self, exchange_id: str, parsed_order: dict):
+        """Non-async bridge: schedule immediate OctoBot processing of a WS-reported fill."""
+        try:
+            loop = asyncio.get_event_loop()
+            loop.create_task(self._process_ws_order_update(exchange_id, parsed_order))
+        except Exception:
+            pass
+
+    async def _process_ws_order_update(self, exchange_id: str, parsed_order: dict):
+        """Push a WS fill directly into OctoBot's order pipeline (skips REST round-trip)."""
+        try:
+            await self.exchange_manager.exchange_personal_data.handle_order_update_from_raw(
+                exchange_id, parsed_order, should_notify=True
+            )
+        except Exception as e:
+            self.logger.debug(
+                f"[Safetrade] Private WS order push failed ({e}); "
+                f"order {exchange_id} will be caught by REST poll"
+            )
 
     async def load_symbol_markets(
         self,
@@ -891,7 +1046,7 @@ class safetrade(exchanges.RestExchange):
     HAS_FETCHED_DETAILS = True
 
     FIX_MARKET_STATUS = False
-    REQUIRE_ORDER_FEES_FROM_TRADES = True
+    REQUIRE_ORDER_FEES_FROM_TRADES = False
     SUPPORT_FETCHING_CANCELLED_ORDERS = False
     IS_SKIPPING_EMPTY_CANDLES_IN_OHLCV_FETCH = True
     ADJUST_FOR_TIME_DIFFERENCE = False
