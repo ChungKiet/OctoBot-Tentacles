@@ -1462,4 +1462,15 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
                     f"No {exchange_manager.exchange_name} exchange symbol data for {self.symbol}, "
                     f"it's probably initializing"
                 )
+        # Fallback: price matrix not yet seeded (fresh start before WS ticker arrives).
+        # Fetch directly from REST so the initial trigger uses a real price.
+        if price < decimal.Decimal('1e-6'):
+            try:
+                client = self.exchange_manager.exchange.connector.client
+                ticker = await client.fetch_ticker(self.symbol)
+                last = ticker.get('last') or ticker.get('close')
+                if last:
+                    price = decimal.Decimal(str(last))
+            except Exception:
+                pass
         return price
