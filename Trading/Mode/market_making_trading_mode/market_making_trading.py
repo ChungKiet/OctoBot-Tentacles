@@ -495,7 +495,6 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
     PRICE_FETCHING_TIMEOUT = 60
     ORDER_ACTION_TIMEOUT = 20
     INIT_RETRY_TIMER = 5
-    FILL_REBUILD_DELAY = 5  # seconds to wait after last fill before rebuilding (batches rapid fills)
     REFERENCE_PRICE_INIT_DELAY = 60 # allow 60s before logging missing reference prices as error
     ORDERS_DESC = "market making"
 
@@ -512,7 +511,6 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
         self.replace_whole_book_distance_threshold: float = 0.5
         self.min_refresh_interval_seconds: float = 0
         self._last_price_refresh_at: float = 0
-        self._pending_fill_rebuild: asyncio.Handle = None
 
         self.symbol_trading_config: dict = None
         self.healthy = False
@@ -1360,11 +1358,8 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
             f"Triggering {self.symbol} [{self.exchange_manager.exchange_name}] order update an order got filled: "
             f"{order}"
         )
-        # Debounce: cancel any pending rebuild and reschedule so rapid fills batch into one rebuild
-        if self._pending_fill_rebuild is not None:
-            self._pending_fill_rebuild.cancel()
-        self._pending_fill_rebuild = asyncio.get_event_loop().call_later(
-            self.FILL_REBUILD_DELAY, self._schedule_order_refresh
+        await self._ensure_market_making_orders(
+            f"filled {order[trading_enums.ExchangeConstantsOrderColumns.SIDE.value]} order"
         )
 
     async def _mark_price_callback(
