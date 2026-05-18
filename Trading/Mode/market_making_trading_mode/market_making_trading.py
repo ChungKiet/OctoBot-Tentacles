@@ -636,7 +636,7 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
                 self._schedule_order_refresh
             )
 
-    async def _ensure_market_making_orders(self, trigger_source: str) -> bool:
+    async def _ensure_market_making_orders(self, trigger_source: str, fill_replace: bool = False) -> bool:
         # can be called:
         #   - on initialization
         #   - when price moves beyond spread
@@ -646,16 +646,17 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
             symbol=self.symbol,
             timeout=self.PRICE_FETCHING_TIMEOUT
         )
-        return await self.create_state(current_price, symbol_market, trigger_source, False)
+        return await self.create_state(current_price, symbol_market, trigger_source, False, fill_replace)
 
     async def create_state(
-        self, current_price, symbol_market, trigger_source: str, force_full_refresh: bool
+        self, current_price, symbol_market, trigger_source: str, force_full_refresh: bool,
+        fill_replace: bool = False
     ) -> bool:
         if current_price is not None:
             async with self.trading_mode_trigger(skip_health_check=True):
                 try:
                     if await self._handle_market_making_orders(
-                        current_price, symbol_market, trigger_source, force_full_refresh
+                        current_price, symbol_market, trigger_source, force_full_refresh, fill_replace
                     ):
                         self.is_first_execution = False
                         self._started_at = self.exchange_manager.exchange.get_exchange_current_time()
@@ -697,7 +698,8 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
 
     @trading_modes.enabled_trader_only(raise_when_disabled=True)
     async def _handle_market_making_orders(
-        self, current_price, symbol_market, trigger_source: str, force_full_refresh: bool
+        self, current_price, symbol_market, trigger_source: str, force_full_refresh: bool,
+        fill_replace: bool = False
     ):
         # 1. get price from external source
         reference_price = await self._get_reference_price()
@@ -862,6 +864,14 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
             can_just_replace_a_few_orders = is_spread_according_to_config and (
                 distance_from_ideal_after_swaps < self.replace_whole_book_distance_threshold
             )
+            if fill_replace and not can_just_replace_a_few_orders:
+                # On fill, skip the depth/volume distance check: only replace the missing order,
+                # don't cancel all remaining open orders.
+                self.logger.info(
+                    f"Fill-replace: overriding distance check (was {distance_from_ideal_after_swaps}) "
+                    f"[trigger source: {trigger_source}]"
+                )
+                can_just_replace_a_few_orders = True
         except order_book_distribution.MissingOrderException as err:
             orders = []
             if isinstance(err, order_book_distribution.MissingAllOrders):
@@ -1359,7 +1369,8 @@ class MarketMakingTradingModeProducer(trading_modes.AbstractTradingModeProducer)
             f"{order}"
         )
         await self._ensure_market_making_orders(
-            f"filled {order[trading_enums.ExchangeConstantsOrderColumns.SIDE.value]} order"
+            f"filled {order[trading_enums.ExchangeConstantsOrderColumns.SIDE.value]} order",
+            fill_replace=True,
         )
 
     async def _mark_price_callback(
