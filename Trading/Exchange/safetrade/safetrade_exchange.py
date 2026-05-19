@@ -25,8 +25,8 @@ import octobot_trading.enums as trading_enums
 import octobot_trading.exchanges as exchanges
 import octobot_trading.exchanges.connectors.ccxt.enums as ccxt_enums
 
-SAFETRADE_BASE_URL = "https://dev.zsmartex.com/api/v2"
-SAFETRADE_WS_BASE = "wss://dev.zsmartex.com/api/v2/websocket"
+SAFETRADE_BASE_URL = "https://safetrade.com/api/v2"
+SAFETRADE_WS_BASE = "wss://safetrade.com/api/v2/websocket"
 REST_KEY = "rest"
 
 class SafetradeAPIError(Exception):
