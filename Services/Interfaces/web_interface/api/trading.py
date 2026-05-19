@@ -100,7 +100,10 @@ def register(blueprint):
         pinned = []
         for base in sorted(exchange_bases):
             entry = by_symbol.get(base)
-            if entry and entry['i'] not in pinned_ids:
+            if not entry:
+                # symbol not on CoinGecko — create a fallback entry so it appears in search
+                entry = {'n': base, 's': base, 'i': base.lower()}
+            if entry['i'] not in pinned_ids:
                 pinned_ids.add(entry['i'])
                 pinned.append(entry)
         remaining = [e for e in all_currencies if e['i'] not in pinned_ids]
