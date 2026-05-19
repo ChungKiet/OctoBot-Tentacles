@@ -206,7 +206,7 @@ class SafetradeClient:
             body_text = ''
             try:
                 from curl_cffi.requests import AsyncSession as _CffiSession
-                async with _CffiSession(impersonate="chrome124") as _sess:
+                async with _CffiSession(impersonate="chrome136") as _sess:
                     _kw: dict = {'headers': headers, 'timeout': 30}
                     if data is not None:
                         _kw['json'] = data
@@ -772,7 +772,7 @@ class SafetradeClient:
             try:
                 from curl_cffi.requests import AsyncSession as _CffiSession
                 url = self._ws_public_url()
-                async with _CffiSession(impersonate='chrome124') as _sess:
+                async with _CffiSession(impersonate='chrome136') as _sess:
                     async with _sess.ws_connect(url) as ws:
                         self._ws_connected = True
                         self._ws_reconnect_delay = 5.0
@@ -862,7 +862,7 @@ class SafetradeClient:
                     'X-Auth-Signature': sig,
                     'User-Agent': self._USER_AGENT,
                 }
-                async with _CffiSession(impersonate='chrome124') as _sess:
+                async with _CffiSession(impersonate='chrome136') as _sess:
                     async with _sess.ws_connect(url, headers=ws_auth_headers) as ws:
                         reconnect_delay = 5.0
                         _log.info(f"[Safetrade] Private WS connected to {url}, subscribing to order/trade events")
